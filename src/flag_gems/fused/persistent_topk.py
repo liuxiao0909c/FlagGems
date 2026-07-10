@@ -34,22 +34,134 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit
+def _radix_topk(
+    row_in,
+    row_output,
+    seq_len,
+    my_chunk_start,
+    CHUNK_SIZE,
+    local_histogram_ptr,
+    suffix_sum_ptr,
+    shared_scalars_ptr,
+    shared_ordered_ptr,
+    g_histogram_ptr,
+    g_state_ptr,
+    cta_in_group,
+    ctas_per_group,
+    barrier_phase,
+    i,
+):
+    return barrier_phase
+
+
+@triton.jit
 def persistent_topk_kernel(
     logits_ptr,
     output_ptr,
     lengths_ptr,
     num_rows,
     stride,
-    topk: tl.constexpr,
+    TOPK: tl.constexpr,
     max_seq_len,
-    chunk_size,
+    CHUNK_SIZE: tl.constexpr,
     ctas_per_group,
+    num_groups,
     g_histogram_ptr,
     g_state_ptr,
     VEC_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    pid = tl.program_id(0)
+    group_id = pid // ctas_per_group
+    cta_in_group = pid % ctas_per_group
+    if pid >= num_groups * ctas_per_group:
+        return  # TODO: remove
+    if cta_in_group != 0 and max_seq_len <= RADIX_THRESHOLD:
+        return
+    local_histogram = tle.gpu.alloc(
+        [RADIX],
+        dtype=tl.uint32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    suffix_sum = tle.gpu.alloc(
+        [RADIX],
+        dtype=tl.uint32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    # TODO:why add 5 in FIXED_SMEM_LARGE
+    shared_scalars = tle.gpu.alloc(
+        [4],
+        dtype=tl.uint32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    shared_ordered = tle.gpu.alloc(
+        [CHUNK_SIZE],
+        dtype=tl.uint32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    local_histogram_ptr = tle.gpu.local_ptr(local_histogram, (0,))
+    suffix_sum_ptr = tle.gpu.local_ptr(suffix_sum, (0,))
+    shared_scalars_ptr = tle.gpu.local_ptr(shared_scalars, (0,))
+    shared_ordered_ptr = tle.gpu.local_ptr(shared_ordered, (0,))
 
+    g_histogram_ptr += group_id * 3 * RADIX
+    g_state_ptr += group_id * 4
+    barrier_phase = tl.zeros((), dtype=tl.uint32)
+    total_iters = tl.cdiv(num_rows, num_groups)
+    for i in tl.range(total_iters):
+        row_idx = group_id + i * num_groups
+        if row_idx >= num_rows:
+            pass
+        seq_len = tl.load(lengths_ptr + row_idx)
+        row_output = output_ptr + row_idx * TOPK
+        row_in = tl.multiply_of(logits_ptr + row_idx * stride, VEC_SIZE * 4)
+        if seq_len <= RADIX_THRESHOLD:
+            if cta_in_group == 0:
+                if seq_len <= TOPK:
+                    num_tiles: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
+                    lane = tl.arange(0, BLOCK_SIZE)
+                    for tile_idx in tl.static_range(0, num_tiles):
+                        pos = tile_idx * BLOCK_SIZE + lane
+                        take_row = pos < seq_len
+                        tl.store(
+                            row_output + pos,
+                            pos.to(tl.int32),
+                            mask=take_row,
+                        )
+                        take_pad = (pos >= seq_len) & (pos < TOPK)
+                        tl.store(row_output + pos, -1, mask=take_pad)
+                elif seq_len <= HIST2048_THRESHOLD:
+                    pass  # TODO: histogram_2048_topk
+                else:
+                    pass  # TODO: histogram_256_topk
+            pass
+        else:
+            my_chunk_start = cta_in_group * CHUNK_SIZE
+            barrier_phase = _radix_topk(
+                row_in,
+                row_output,
+                seq_len,
+                my_chunk_start,
+                CHUNK_SIZE,
+                local_histogram_ptr,
+                suffix_sum_ptr,
+                shared_scalars_ptr,
+                shared_ordered_ptr,
+                g_histogram_ptr,
+                g_state_ptr,
+                cta_in_group,
+                ctas_per_group,
+                barrier_phase,
+                i,
+            )
     return
 
 
@@ -115,11 +227,14 @@ def persistent_topk(
     max_chunk_elements = (max_chunk_elements // vec_size) * vec_size
     min_chunk = vec_size * THREADS_PER_BLOCK
     max_chunk_elements = max(max_chunk_elements, min_chunk)
+    max_chunk_elements = triton.next_power_of_2(max_chunk_elements)
 
     ctas_per_group = (stride + max_chunk_elements - 1) // max_chunk_elements
     chunk_size = (stride + ctas_per_group - 1) // ctas_per_group
     chunk_size = ((chunk_size + vec_size - 1) // vec_size) * vec_size
+    chunk_size = triton.next_power_of_2(chunk_size)
     chunk_size = min(max_chunk_elements, chunk_size)
+    assert chunk_size >= available_for_ordered // 4, "fail to get chunk_size"
 
     smem_size = FIXED_SMEM_LARGE + chunk_size * 4  # sizeof(uint32)
     smem_size = max(SMEM_MEDIUM, smem_size)
@@ -164,6 +279,7 @@ def persistent_topk(
         max_seq_len,
         chunk_size,
         ctas_per_group,
+        num_groups,
         g_histogram,
         g_state,
         VEC_SIZE=vec_size,
