@@ -34,12 +34,42 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit
+def _convert_to_uint32_v2(x):
+    bits = x.to(tl.uint32, bitcast=True)
+    return tl.where((bits & 0x80000000) != 0, ~bits, (bits | 0x80000000))
+
+
+@triton.jit
+def _distribute_to_bins(
+    ordered,
+    round_idx: tl.constexpr,
+    prefix,
+    shift_bits,
+    local_histogram_ptr,
+    in_range,
+):
+    if round_idx == 0:
+        mask = 0
+    else:
+        mask = (~0) << (32 - round_idx * 8)
+    match = (ordered & mask) == prefix
+    bucket = (ordered >> shift_bits) & 0xFF
+    tl.atomic_add(
+        local_histogram_ptr + bucket,
+        ones,
+        mask=match & in_range,
+        sem="relaxed",
+        scope="cta",
+    )
+
+
+@triton.jit
 def _radix_topk(
     row_in,
     row_output,
     seq_len,
     my_chunk_start,
-    CHUNK_SIZE,
+    CHUNK_SIZE: tl.constexpr,
     local_histogram_ptr,
     suffix_sum_ptr,
     shared_scalars_ptr,
@@ -49,8 +79,194 @@ def _radix_topk(
     cta_in_group,
     ctas_per_group,
     barrier_phase,
-    i,
+    iter_idx,
+    TOPK: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
+    my_chunk_end = my_chunk_start + CHUNK_SIZE
+    my_chunk_end = min(my_chunk_end, seq_len)
+    row_len = my_chunk_end - my_chunk_start if my_chunk_start < seq_len else 0
+    lane = tl.arange(0, BLOCK_SIZE)
+    ones = tl.full([BLOCK_SIZE], 1, tl.int32)
+    zeros = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+
+    # -- Stage 1: Load chunk to shared memory as ordered uint32 --
+    n_vec_full = row_len // (BLOCK_SIZE * VEC_SIZE)
+    rem_tiles = (row_len - n_vec_full * BLOCK_SIZE * VEC_SIZE) // BLOCK_SIZE
+    rem_elems = row_len % BLOCK_SIZE
+    for t in tl.range(0, n_vec_full):
+        base = t * BLOCK_SIZE * VEC_SIZE + lane * VEC_SIZE
+        offs = base[:, None] + vec[None, :]
+        x = tl.load(row_in + offs)
+        bits = convert_to_uint32_v2(x)
+        tl.store(shared_ordered_ptr + offs, bits)
+    for t in tl.range(0, rem_tiles):
+        offs = (n_vec_full * VEC_SIZE + t) * BLOCK_SIZE + lane
+        x = tl.load(row_in + offs)
+        bits = convert_to_uint32_v2(x)
+        tl.store(shared_ordered_ptr + offs, bits)
+    if rem_elems > 0:
+        offs = (n_vec_full * VEC_SIZE + rem_tiles) * BLOCK_SIZE + lane
+        in_range = lane < rem_elems
+        x = tl.load(row_in + offs, mask=in_range, other=float("-inf"))
+        bits = convert_to_uint32_v2(x)
+        tl.store(shared_ordered_ptr + offs, bits, mask=in_range)
+    tl.debug_barrier()
+
+    # -- Init radix select state --
+    tl.store(shared_scalars_ptr + zeros, 0, mask=lane == 0)  # prefix
+    tl.store(shared_scalars_ptr + 1 + zeros, TOPK, mask=lane == 0)  # remaining_k
+    tl.debug_barrier()
+
+    # -- Initial barrier --
+    tl.atomic_add(
+        g_state_ptr + 2 + zeros,  # arrival_counter
+        ones,
+        mask=lane == 0,
+        sem="relaxed",
+        scope="gpu",
+    )
+    # TODO: every thread query, no following debug_barrier needed
+    while True:
+        arrival_counter = tl.atomic_add(
+            g_state_ptr + 2,
+            0,
+            sem="relaxed",
+            scope="gpu",
+        )
+        if arrival_counter < ((barrier_phase + 1) * ctas_per_group):
+            pass
+        break
+    barrier_phase += 1
+
+    if cta_in_group == 0:
+        tl.store(g_state_ptr + 3 + zeros,  zeros, mask=lane == 0)  # output_counter
+
+    # -- Stage 2: 4 rounds of radix select --
+    for round_idx in tl.static_range(0, 4):
+        global_round = iter_idx * 4 + round_idx
+        shift_bits = 24 - round_idx * 8
+        prefix = tl.load(shared_scalars_ptr)
+        remaining_k = tl.load(shared_scalars_ptr + 1)
+
+        current_hist_ptr = g_histogram_ptr + (global_round % 3) * RADIX
+        next_hist_ptr = g_histogram_ptr + ((global_round + 1) % 3) * RADIX
+
+        tl.store(local_histogram_ptr + lane, 0, mask=lane < RADIX_SIZE_FINAL)
+        tl.debug_barrier()
+
+        for t in tl.range(0, n_vec_full):
+            base = t * BLOCK_SIZE * VEC_SIZE + lane * VEC_SIZE
+            offs = base[:, None] + vec[None, :]
+            ordered = tl.load(shared_ordered_ptr + offs)
+            _distribute_to_bins(
+                ordered,
+                round_idx,
+                prefix,
+                shift_bits,
+                local_histogram_ptr,
+                True,
+            )
+        for t in tl.range(0, rem_tiles):
+            offs = (n_vec_full * VEC_SIZE + t) * BLOCK_SIZE + lane
+            ordered = tl.load(shared_ordered_ptr + offs)
+            _distribute_to_bins(
+                ordered,
+                round_idx,
+                prefix,
+                shift_bits,
+                local_histogram_ptr,
+                True,
+            )
+        if rem_elems > 0:
+            offs = (n_vec_full * VEC_SIZE + rem_tiles) * BLOCK_SIZE + lane
+            in_range = lane < rem_elems
+            ordered = tl.load(shared_ordered_ptr + offs, mask=in_range, other=0) 
+            _distribute_to_bins(
+                ordered,
+                round_idx,
+                prefix,
+                shift_bits,
+                local_histogram_ptr,
+                in_range,
+            )
+        tl.debug_barrier()
+
+        counts = tl.load(local_histogram_ptr + lane, mask=lane < RADIX)
+        tl.atomic_add(
+            current_hist_ptr + zeros,
+            counts,
+            mask=lane < RADIX,
+            sem="relaxed",
+            scope="gpu",
+        )
+
+        if cta_in_group == 0:
+            tl.store(next_hist_ptr + lane, 0, mask=lane < RADIX)
+
+        tl.atomic_add(
+            g_state_ptr + 2 + zeros,  # arrival_counter
+            ones,
+            mask=lane == 0,
+            sem="relaxed",
+            scope="gpu",
+        )
+        # TODO: every thread query, no following debug_barrier needed
+        while True:
+            arrival_counter = tl.atomic_add(
+                g_state_ptr + 2,
+                0,
+                sem="relaxed",
+                scope="gpu",
+            )
+            if arrival_counter < ((barrier_phase + 1) * ctas_per_group):
+                pass
+            break
+        barrier_phase += 1
+
+        g_counts = tl.load(current_hist_ptr + lane, mask=lane < RADIX)
+        tl.store(suffix_sum_ptr + lane, g_counts, mask=lane < RADIX)
+        tl.debug_barrier()
+
+        # for (uint32_t stride = 1; stride < RADIX; stride *= 2) {
+        for t in tl.static_range(0, 8):  # RADIX=(1 << 8)
+            val = tl.load(suffix_sum_ptr + lane, mask=lane < RADIX)
+            other_off = lane + (1 << t)
+            tmp = tl.load(suffix_sum_ptr + other_off, mask=other_off < RADIX, other=0)
+            val += tmp
+            tl.debug_barrier()
+            tl.store(suffix_sum_ptr + lane, val, mask=lane < RADIX)
+            tl.debug_barrier()
+
+        tl.store(shared_scalars_ptr + 2 + zeros, 0, mask=lane == 0)  # threshold_bin
+        tl.store(shared_scalars_ptr + 3 + zeros, remaining_k, mask=lane == 0)  # next_remaining_k
+        tl.debug_barrier()
+
+        count_ge = tl.load(suffix_sum_ptr + lane, mask=lane < RADIX)
+        count_gt = tl.load(suffix_sum_ptr + lane + 1, mask=(lane + 1) < RADIX, other=0)
+        threshold_mask = (count_ge >= remaining_k) & (count_gt < remaining_k)
+        tl.store(shared_scalars_ptr + 2 + zeros, lane, mask=threshold_mask)
+        tl.store(shared_scalars_ptr + 3 + zeros, remaining_k - count_gt, mask=threshold_mask)
+        tl.debug_barrier()
+
+        threshold_bin = tl.load(shared_scalars_ptr + 2 + zeros, mask=lane == 0, other=0) 
+        new_prefix = prefix[None] | (threshold_bin << shift)
+        tl.store(shared_scalars_ptr + zeros, threshold_bin, mask=lane == 0)
+        next_remaining_k = tl.load(shared_scalars_ptr + 3 + zeros, mask=lane == 0, other=0)
+        tl.store(shared_scalars_ptr + 1 + zeros, next_remaining_k, mask=lane == 0)
+        tl.debug_barrier()
+    # end 4 radix rounds
+
+    # -- Count local > pivot elements --
+    ordered_pivot = tl.load(shared_scalars_ptr)
+    tl.store(suffix_sum_ptr + lane, 0, mask=lane == 0)
+    tl.debug_barrier()
+
+    my_gt_count = tl.full((), 0, dtype=tl.uint32)
+
+
+
     return barrier_phase
 
 
@@ -161,6 +377,9 @@ def persistent_topk_kernel(
                 ctas_per_group,
                 barrier_phase,
                 i,
+                TOPK,
+                VEC_SIZE,
+                BLOCK_SIZE,
             )
     return
 
