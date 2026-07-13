@@ -40,27 +40,33 @@ def _convert_to_uint32_v2(x):
 
 
 @triton.jit
-def _distribute_to_bins(
-    ordered,
-    round_idx: tl.constexpr,
-    prefix,
-    shift_bits,
-    local_histogram_ptr,
-    in_range,
+def _barrier_with_atomic_add(
+    arrival_counter_ptr,
+    zeros,
+    lane,
+    thresold,
 ):
-    if round_idx == 0:
-        mask = 0
-    else:
-        mask = (~0) << (32 - round_idx * 8)
-    match = (ordered & mask) == prefix
-    bucket = (ordered >> shift_bits) & 0xFF
     tl.atomic_add(
-        local_histogram_ptr + bucket,
-        ones,
-        mask=match & in_range,
+        arrival_counter_ptr + zeros,
+        1,
+        mask=lane == 0,
         sem="relaxed",
-        scope="cta",
+        scope="gpu",
     )
+    # TODO: every thread query, no following debug_barrier needed
+    arrival_counter = tl.atomic_add(
+        arrival_counter_ptr,
+        0,
+        sem="relaxed",
+        scope="gpu",
+    )
+    while arrival_counter < thresold:
+        arrival_counter = tl.atomic_add(
+            arrival_counter_ptr,
+            0,
+            sem="relaxed",
+            scope="gpu",
+        )
 
 
 @triton.jit
@@ -84,12 +90,16 @@ def _radix_topk(
     VEC_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    RADIX: tl.constexpr = 256
+
     my_chunk_end = my_chunk_start + CHUNK_SIZE
     my_chunk_end = min(my_chunk_end, seq_len)
     actual_chunk_size = my_chunk_end - my_chunk_start if my_chunk_start < seq_len else 0
     lane = tl.arange(0, BLOCK_SIZE)
     ones = tl.full([BLOCK_SIZE], 1, tl.uint32)
     zeros = tl.zeros([BLOCK_SIZE], dtype=tl.uint32)
+    zeros_2d = tl.zeros([BLOCK_SIZE, VEC_SIZE], dtype=tl.uint32)
+    vec = tl.arange(0, VEC_SIZE)
 
     # -- Stage 1: Load chunk to shared memory as ordered uint32 --
     # TODO: remove rem_tiles, rem_elems
@@ -100,18 +110,18 @@ def _radix_topk(
         base = t * BLOCK_SIZE * VEC_SIZE + lane * VEC_SIZE
         offs = base[:, None] + vec[None, :]
         x = tl.load(row_input + offs)
-        bits = convert_to_uint32_v2(x)
+        bits = _convert_to_uint32_v2(x)
         tl.store(shared_ordered_ptr + offs, bits)
     for t in tl.range(0, rem_tiles):
         offs = (n_vec_full * VEC_SIZE + t) * BLOCK_SIZE + lane
         x = tl.load(row_input + offs)
-        bits = convert_to_uint32_v2(x)
+        bits = _convert_to_uint32_v2(x)
         tl.store(shared_ordered_ptr + offs, bits)
     if rem_elems > 0:
         offs = (n_vec_full * VEC_SIZE + rem_tiles) * BLOCK_SIZE + lane
         in_range = lane < rem_elems
         x = tl.load(row_input + offs, mask=in_range, other=float("-inf"))
-        bits = convert_to_uint32_v2(x)
+        bits = _convert_to_uint32_v2(x)
         tl.store(shared_ordered_ptr + offs, bits, mask=in_range)
     tl.debug_barrier()
 
@@ -121,26 +131,13 @@ def _radix_topk(
     tl.debug_barrier()
 
     # -- Initial barrier --
-    tl.atomic_add(
-        g_state_ptr + 2 + zeros,  # arrival_counter
-        1,
-        mask=lane == 0,
-        sem="relaxed",
-        scope="gpu",
+    _barrier_with_atomic_add(
+        g_state_ptr + 2,
+        zeros,
+        lane,
+        (barrier_phase + 1) * ctas_per_group,
     )
-    while lane != 0:
-        arrival_counter = tl.atomic_add(
-            g_state_ptr + 2 + zeros,
-            0,
-            mask=lane == 0,
-            sem="relaxed",
-            scope="gpu",
-        )
-        if arrival_counter < ((barrier_phase + 1) * ctas_per_group):
-            pass
-        break
     barrier_phase += 1
-    tl.debug_barrier()
 
     if cta_in_group == 0:
         tl.store(g_state_ptr + 3 + zeros, 0, mask=lane == 0)  # output_counter
@@ -163,7 +160,7 @@ def _radix_topk(
             base = t * BLOCK_SIZE * VEC_SIZE + lane * VEC_SIZE
             offs = base[:, None] + vec[None, :]
             ordered = tl.load(shared_ordered_ptr + offs)
-            mask = 0 is round_idx == 0 else ((~0) << (32 - round_idx * 8))
+            mask = 0 if round_idx == 0 else ((~0) << (32 - round_idx * 8))
             match = (ordered & mask) == prefix
             bucket = (ordered >> shift_bits) & 0xFF
             tl.atomic_add(
@@ -176,7 +173,7 @@ def _radix_topk(
         for t in tl.range(0, rem_tiles):
             offs = (n_vec_full * VEC_SIZE + t) * BLOCK_SIZE + lane
             ordered = tl.load(shared_ordered_ptr + offs)
-            mask = 0 is round_idx == 0 else ((~0) << (32 - round_idx * 8))
+            mask = 0 if round_idx == 0 else ((~0) << (32 - round_idx * 8))
             match = (ordered & mask) == prefix
             bucket = (ordered >> shift_bits) & 0xFF
             tl.atomic_add(
@@ -190,7 +187,7 @@ def _radix_topk(
             offs = (n_vec_full * VEC_SIZE + rem_tiles) * BLOCK_SIZE + lane
             in_range = lane < rem_elems
             ordered = tl.load(shared_ordered_ptr + offs, mask=in_range, other=0) 
-            mask = 0 is round_idx == 0 else ((~0) << (32 - round_idx * 8))
+            mask = 0 if round_idx == 0 else ((~0) << (32 - round_idx * 8))
             match = (ordered & mask) == prefix
             bucket = (ordered >> shift_bits) & 0xFF
             tl.atomic_add(
@@ -214,26 +211,13 @@ def _radix_topk(
         if cta_in_group == 0:
             tl.store(next_hist_ptr + lane, 0, mask=lane < RADIX)
 
-        tl.atomic_add(
-            g_state_ptr + 2 + zeros,  # arrival_counter
-            1,
-            mask=lane == 0,
-            sem="relaxed",
-            scope="gpu",
+        _barrier_with_atomic_add(
+            g_state_ptr + 2,
+            zeros,
+            lane,
+            (barrier_phase + 1) * ctas_per_group,
         )
-        while lane != 0:
-            arrival_counter = tl.atomic_add(
-                g_state_ptr + 2 + zeros,
-                0,
-                mask=lane == 0,
-                sem="relaxed",
-                scope="gpu",
-            )
-            if arrival_counter < ((barrier_phase + 1) * ctas_per_group):
-                pass
-            break
         barrier_phase += 1
-        tl.debug_barrier()
 
         g_counts = tl.load(current_hist_ptr + lane, mask=lane < RADIX)
         tl.store(suffix_sum_ptr + lane, g_counts, mask=lane < RADIX)
@@ -261,7 +245,7 @@ def _radix_topk(
         tl.debug_barrier()
 
         threshold_bin = tl.load(shared_scalars_ptr + 2 + zeros, mask=lane == 0, other=0) 
-        new_prefix = prefix | (threshold_bin << shift)
+        new_prefix = prefix | (threshold_bin << shift_bits)
         tl.store(shared_scalars_ptr + zeros, threshold_bin, mask=lane == 0)
         next_remaining_k = tl.load(shared_scalars_ptr + 3 + zeros, mask=lane == 0, other=0)
         tl.store(shared_scalars_ptr + 1 + zeros, next_remaining_k, mask=lane == 0)
@@ -274,14 +258,14 @@ def _radix_topk(
     #tl.store(suffix_sum_ptr + zeros, 0, mask=lane == 0)
     #tl.debug_barrier()
 
-    my_gt_count = tl.full((), 0, dtype=tl.uint32)
+    my_gt_count = tl.full((BLOCK_SIZE,), 0, dtype=tl.uint32)
     # TODO: no vec load from smem
     for t in tl.range(0, n_vec_full):
         base = t * BLOCK_SIZE * VEC_SIZE + lane * VEC_SIZE
         offs = base[:, None] + vec[None, :]
         ordered = tl.load(shared_ordered_ptr + offs)
         gt_mask = ordered > ordered_pivot
-        my_gt_count += gt_mask.to(tl.uint32)
+        my_gt_count += tl.sum(gt_mask.to(tl.uint32), axis=-1)
     for t in tl.range(0, rem_tiles):
         offs = (n_vec_full * VEC_SIZE + t) * BLOCK_SIZE + lane
         ordered = tl.load(shared_ordered_ptr + offs)
@@ -315,13 +299,13 @@ def _radix_topk(
         ordered = tl.load(shared_ordered_ptr + offs)
         gt_mask = ordered > ordered_pivot
         local_pos = tl.atomic_add(
-            local_histogram_ptr + zeros,
+            local_histogram_ptr + zeros_2d,
             1,
             mask=gt_mask,
             sem="relaxed",
             scope="cta",
         )
-        tl.store(row_output + gt_pos + local_pos, my_chunk_start + offs, mask=gt_mask) 
+        tl.store(row_output + gt_pos[:, None] + local_pos, my_chunk_start + offs, mask=gt_mask) 
     for t in tl.range(0, rem_tiles):
         offs = (n_vec_full * VEC_SIZE + t) * BLOCK_SIZE + lane
         ordered = tl.load(shared_ordered_ptr + offs)
@@ -348,26 +332,13 @@ def _radix_topk(
         )
         tl.store(row_output + gt_pos + local_pos, my_chunk_start + offs, mask=gt_mask)
 
-    tl.atomic_add(
-        g_state_ptr + 2 + zeros,  # arrival_counter
-        1,
-        mask=lane == 0,
-        sem="relaxed",
-        scope="gpu",
+    _barrier_with_atomic_add(
+        g_state_ptr + 2,
+        zeros,
+        lane,
+        (barrier_phase + 1) * ctas_per_group,
     )
-    while lane != 0:
-        arrival_counter = tl.atomic_add(
-            g_state_ptr + 2 + zeros,
-            0,
-            mask=lane == 0,
-            sem="relaxed",
-            scope="gpu",
-        )
-        if arrival_counter < ((barrier_phase + 1) * ctas_per_group):
-            pass
-        break
     barrier_phase += 1
-    tl.debug_barrier()
 
     # TODO: no vec load from smem
     for t in tl.range(0, n_vec_full):
@@ -376,7 +347,7 @@ def _radix_topk(
         ordered = tl.load(shared_ordered_ptr + offs)
         eq_mask = ordered == ordered_pivot
         eq_pos = tl.atomic_add(
-            g_state_ptr + 3 + zeros,
+            g_state_ptr + 3 + zeros_2d,
             1,
             mask=eq_mask,
             sem="relaxed",
@@ -429,6 +400,10 @@ def persistent_topk_kernel(
     VEC_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    RADIX_THRESHOLD: tl.constexpr = 32768
+    RADIX: tl.constexpr = 256
+    HIST2048_THRESHOLD: tl.constexpr = 8192
+
     pid = tl.program_id(0)
     group_id = pid // ctas_per_group
     cta_in_group = pid % ctas_per_group
@@ -480,7 +455,7 @@ def persistent_topk_kernel(
             pass
         seq_len = tl.load(lengths_ptr + row_idx)
         row_output = output_ptr + row_idx * TOPK
-        row_in = tl.multiply_of(logits_ptr + row_idx * stride, VEC_SIZE * 4)
+        row_in = tl.multiple_of(logits_ptr + row_idx * stride, VEC_SIZE * 4)
         if seq_len <= RADIX_THRESHOLD:
             if cta_in_group == 0:
                 if seq_len <= TOPK:
