@@ -452,55 +452,55 @@ def persistent_topk_kernel(
     total_iters = tl.cdiv(num_rows, num_groups)
     for i in tl.range(total_iters):
         row_idx = group_id + i * num_groups
-        if row_idx >= num_rows:
-            pass
-        seq_len = tl.load(lengths_ptr + row_idx)
-        row_output = output_ptr + row_idx * TOPK
-        row_in = tl.multiple_of(logits_ptr + row_idx * stride, VEC_SIZE * 4)
-        if seq_len <= RADIX_THRESHOLD:
-            if cta_in_group == 0:
-                if seq_len <= TOPK:
-                    num_tiles: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
-                    lane = tl.arange(0, BLOCK_SIZE)
-                    for tile_idx in tl.static_range(0, num_tiles):
-                        pos = tile_idx * BLOCK_SIZE + lane
-                        take_row = pos < seq_len
-                        tl.store(
-                            row_output + pos,
-                            pos.to(tl.int32),
-                            mask=take_row,
-                        )
-                        take_pad = (pos >= seq_len) & (pos < TOPK)
-                        tl.store(row_output + pos, -1, mask=take_pad)
-                elif seq_len <= HIST2048_THRESHOLD:
-                    tl.device_print("histogram_2048_topk:", 0)
-                    pass  # TODO: histogram_2048_topk
-                else:
-                    tl.device_print("histogram_256_topk:", 0)
-                    pass  # TODO: histogram_256_topk
-            pass
-        else:
-            my_chunk_start = cta_in_group * CHUNK_SIZE
-            barrier_phase = _radix_topk(
-                row_in,
-                row_output,
-                seq_len,
-                my_chunk_start,
-                CHUNK_SIZE,
-                local_histogram_ptr,
-                suffix_sum_ptr,
-                shared_scalars_ptr,
-                shared_ordered_ptr,
-                g_histogram_ptr,
-                g_state_ptr,
-                cta_in_group,
-                ctas_per_group,
-                barrier_phase,
-                i,
-                TOPK,
-                VEC_SIZE,
-                BLOCK_SIZE,
-            )
+        if row_idx < num_rows:
+            seq_len = tl.load(lengths_ptr + row_idx)
+            row_output = output_ptr + row_idx * TOPK
+            row_in = tl.multiple_of(logits_ptr + row_idx * stride, VEC_SIZE * 4)
+            if seq_len <= RADIX_THRESHOLD:
+                if cta_in_group == 0:
+                    if seq_len <= TOPK:
+                        num_tiles: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
+                        lane = tl.arange(0, BLOCK_SIZE)
+                        for tile_idx in tl.static_range(0, num_tiles):
+                            pos = tile_idx * BLOCK_SIZE + lane
+                            take_row = pos < seq_len
+                            tl.store(
+                                row_output + pos,
+                                pos.to(tl.int32),
+                                mask=take_row,
+                            )
+                            take_pad = (pos >= seq_len) & (pos < TOPK)
+                            tl.store(row_output + pos, -1, mask=take_pad)
+                        tl.device_print("seq_len <= TOPK:", 0)
+                    elif seq_len <= HIST2048_THRESHOLD:
+                        tl.device_print("histogram_2048_topk:", 0)
+                        pass  # TODO: histogram_2048_topk
+                    else:
+                        tl.device_print("histogram_256_topk:", 0)
+                        pass  # TODO: histogram_256_topk
+                pass
+            else:
+                my_chunk_start = cta_in_group * CHUNK_SIZE
+                barrier_phase = _radix_topk(
+                    row_in,
+                    row_output,
+                    seq_len,
+                    my_chunk_start,
+                    CHUNK_SIZE,
+                    local_histogram_ptr,
+                    suffix_sum_ptr,
+                    shared_scalars_ptr,
+                    shared_ordered_ptr,
+                    g_histogram_ptr,
+                    g_state_ptr,
+                    cta_in_group,
+                    ctas_per_group,
+                    barrier_phase,
+                    i,
+                    TOPK,
+                    VEC_SIZE,
+                    BLOCK_SIZE,
+                )
     return
 
 
