@@ -50,25 +50,26 @@ def _barrier_with_atomic_add(
         arrival_counter_ptr + zeros,
         1,
         mask=lane == 0,
-        sem="relaxed",
+        sem="release",
         scope="gpu",
     )
     # TODO: every thread query, no following debug_barrier needed
     arrival_counter = tl.atomic_add(
         arrival_counter_ptr,
         0,
-        sem="relaxed",
+        sem="acquire",
         scope="gpu",
     )
     while arrival_counter < thresold:
         arrival_counter = tl.atomic_add(
             arrival_counter_ptr,
             0,
-            sem="relaxed",
+            sem="acquire",
             scope="gpu",
         )
 
 
+# Extracted from persistent_topk.cuh in https://github.com/vllm-project/vllm
 @triton.jit
 def _radix_topk(
     row_input,
@@ -109,18 +110,18 @@ def _radix_topk(
     for t in tl.range(0, n_vec_full):
         base = t * BLOCK_SIZE * VEC_SIZE + lane * VEC_SIZE
         offs = base[:, None] + vec[None, :]
-        x = tl.load(row_input + offs)
+        x = tl.load(row_input + my_chunk_start + offs)
         bits = _convert_to_uint32_v2(x)
         tl.store(shared_ordered_ptr + offs, bits)
     for t in tl.range(0, rem_tiles):
         offs = (n_vec_full * VEC_SIZE + t) * BLOCK_SIZE + lane
-        x = tl.load(row_input + offs)
+        x = tl.load(row_input + my_chunk_start + offs)
         bits = _convert_to_uint32_v2(x)
         tl.store(shared_ordered_ptr + offs, bits)
     if rem_elems > 0:
         offs = (n_vec_full * VEC_SIZE + rem_tiles) * BLOCK_SIZE + lane
         in_range = lane < rem_elems
-        x = tl.load(row_input + offs, mask=in_range, other=float("-inf"))
+        x = tl.load(row_input + my_chunk_start + offs, mask=in_range, other=float("-inf"))
         bits = _convert_to_uint32_v2(x)
         tl.store(shared_ordered_ptr + offs, bits, mask=in_range)
     tl.debug_barrier()
@@ -138,6 +139,7 @@ def _radix_topk(
         (barrier_phase + 1) * ctas_per_group,
     )
     barrier_phase += 1
+    #tl.debug_barrier()
 
     if cta_in_group == 0:
         tl.store(g_state_ptr + 3 + zeros, 0, mask=lane == 0)  # output_counter
@@ -149,6 +151,7 @@ def _radix_topk(
         prefix = tl.load(shared_scalars_ptr)
         remaining_k = tl.load(shared_scalars_ptr + 1)
 
+        # current_hist inited zero in host-side or pre iter of group
         current_hist_ptr = g_histogram_ptr + (global_round % 3) * RADIX
         next_hist_ptr = g_histogram_ptr + ((global_round + 1) % 3) * RADIX
 
@@ -201,7 +204,7 @@ def _radix_topk(
 
         counts = tl.load(local_histogram_ptr + lane, mask=lane < RADIX)
         tl.atomic_add(
-            current_hist_ptr + zeros,
+            current_hist_ptr + lane,
             counts,
             mask=(counts > 0) & (lane < RADIX),
             sem="relaxed",
@@ -218,13 +221,13 @@ def _radix_topk(
             (barrier_phase + 1) * ctas_per_group,
         )
         barrier_phase += 1
+        #tl.debug_barrier()
 
-        g_counts = tl.load(current_hist_ptr + lane, mask=lane < RADIX)
+        g_counts = tl.load(current_hist_ptr + lane, mask=lane < RADIX, other=0)
         tl.store(suffix_sum_ptr + lane, g_counts, mask=lane < RADIX)
         tl.debug_barrier()
 
-        # for (uint32_t stride = 1; stride < RADIX; stride *= 2) {
-        for t in tl.static_range(0, 8):  # RADIX=(1 << 8)
+        for t in tl.static_range(0, 8):
             val = tl.load(suffix_sum_ptr + lane, mask=lane < RADIX)
             other_offs = lane + (1 << t)
             tmp = tl.load(suffix_sum_ptr + other_offs, mask=other_offs < RADIX, other=0)
@@ -237,16 +240,16 @@ def _radix_topk(
         tl.store(shared_scalars_ptr + 3 + zeros, remaining_k, mask=lane == 0)  # next_remaining_k
         tl.debug_barrier()
 
-        count_ge = tl.load(suffix_sum_ptr + lane, mask=lane < RADIX)
+        count_ge = tl.load(suffix_sum_ptr + lane, mask=lane < RADIX, other=0)
         count_gt = tl.load(suffix_sum_ptr + lane + 1, mask=(lane + 1) < RADIX, other=0)
-        threshold_mask = (count_ge >= remaining_k) & (count_gt < remaining_k)
+        threshold_mask = (count_ge >= remaining_k) & (count_gt < remaining_k) & (lane < RADIX)
         tl.store(shared_scalars_ptr + 2 + zeros, lane, mask=threshold_mask)
         tl.store(shared_scalars_ptr + 3 + zeros, remaining_k - count_gt, mask=threshold_mask)
         tl.debug_barrier()
 
-        threshold_bin = tl.load(shared_scalars_ptr + 2 + zeros, mask=lane == 0, other=0) 
+        threshold_bin = tl.load(shared_scalars_ptr + 2 + zeros, mask=lane == 0, other=0)
         new_prefix = prefix | (threshold_bin << shift_bits)
-        tl.store(shared_scalars_ptr + zeros, threshold_bin, mask=lane == 0)
+        tl.store(shared_scalars_ptr + zeros, new_prefix, mask=lane == 0)
         next_remaining_k = tl.load(shared_scalars_ptr + 3 + zeros, mask=lane == 0, other=0)
         tl.store(shared_scalars_ptr + 1 + zeros, next_remaining_k, mask=lane == 0)
         tl.debug_barrier()
@@ -254,10 +257,6 @@ def _radix_topk(
 
     # -- Count local > pivot elements --
     ordered_pivot = tl.load(shared_scalars_ptr)
-    # no usage of suffix_sum[0]
-    #tl.store(suffix_sum_ptr + zeros, 0, mask=lane == 0)
-    #tl.debug_barrier()
-
     my_gt_count = tl.full((BLOCK_SIZE,), 0, dtype=tl.uint32)
     # TODO: no vec load from smem
     for t in tl.range(0, n_vec_full):
@@ -282,7 +281,6 @@ def _radix_topk(
 
     # -- Stage 3: Collect top-k indices --
     tl.store(local_histogram_ptr + zeros, 0, mask=lane == 0)
-    # no usage of local_histogram[1]
     gt_pos = tl.atomic_add(
         g_state_ptr + 3 + zeros,
         local_gt_count,
@@ -290,7 +288,9 @@ def _radix_topk(
         sem="relaxed",
         scope="gpu",
     )
+    tl.store(local_histogram_ptr + 1 + zeros, gt_pos, mask=lane == 0)
     tl.debug_barrier()
+    gt_pos = tl.load(local_histogram_ptr + 1 + zeros)
 
     # TODO: no vec load from smem
     for t in tl.range(0, n_vec_full):
@@ -339,6 +339,7 @@ def _radix_topk(
         (barrier_phase + 1) * ctas_per_group,
     )
     barrier_phase += 1
+    #tl.debug_barrier()
 
     # TODO: no vec load from smem
     for t in tl.range(0, n_vec_full):
@@ -472,8 +473,10 @@ def persistent_topk_kernel(
                         take_pad = (pos >= seq_len) & (pos < TOPK)
                         tl.store(row_output + pos, -1, mask=take_pad)
                 elif seq_len <= HIST2048_THRESHOLD:
+                    tl.device_print("histogram_2048_topk:", 0)
                     pass  # TODO: histogram_2048_topk
                 else:
+                    tl.device_print("histogram_256_topk:", 0)
                     pass  # TODO: histogram_256_topk
             pass
         else:
@@ -570,7 +573,17 @@ def persistent_topk(
     chunk_size = ((chunk_size + vec_size - 1) // vec_size) * vec_size
     chunk_size = triton.next_power_of_2(chunk_size)
     chunk_size = min(max_chunk_elements, chunk_size)
-    assert chunk_size >= available_for_ordered // 4, "fail to get chunk_size"
+    while chunk_size > available_for_ordered // 4:
+        max_chunk_elements = max_chunk_elements >> 1
+        if max_chunk_elements < min_chunk:
+            chunk_size = min_chunk
+            assert chunk_size <= available_for_ordered // 4
+            break
+        ctas_per_group = (stride + max_chunk_elements - 1) // max_chunk_elements
+        chunk_size = (stride + ctas_per_group - 1) // ctas_per_group
+        chunk_size = ((chunk_size + vec_size - 1) // vec_size) * vec_size
+        chunk_size = triton.next_power_of_2(chunk_size)
+        chunk_size = min(max_chunk_elements, chunk_size)
 
     smem_size = FIXED_SMEM_LARGE + chunk_size * 4  # sizeof(uint32)
     smem_size = max(SMEM_MEDIUM, smem_size)
@@ -599,6 +612,7 @@ def persistent_topk(
     #     int output_counter;
     histogram_bytes = RADIX * 3 * 4
     radix_row_state_bytes = histogram_bytes + 4 * 4
+    assert workspace.size(0) >= num_groups * radix_row_state_bytes
     workspace[:(num_groups * radix_row_state_bytes)] = 0
     g_histogram_size = num_groups * histogram_bytes
     g_state_size = num_groups * 4 * 4
