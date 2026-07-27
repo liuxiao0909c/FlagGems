@@ -46,20 +46,27 @@ class GroupedTopKBenchmark(base.Benchmark):
 
     def set_shapes(self, shape_file_path=None):
         grouped_topk_configs = [
-            (1, 64, 8, 2, 8),
-            (8, 64, 8, 2, 8),
-            (32, 64, 8, 2, 8),
-            (64, 64, 8, 2, 8),
-            (128, 64, 8, 2, 8),
-            (256, 64, 8, 2, 8),
-            (32, 128, 8, 2, 8),
-            (64, 128, 8, 2, 8),
-            (128, 128, 8, 2, 8),
-            (64, 64, 4, 2, 4),
-            (64, 128, 16, 2, 8),
-            (512, 64, 8, 2, 8),
-            (1024, 64, 8, 2, 8),
-            (2048, 64, 8, 2, 8),
+            # Deepseek-3.2
+            (num_tokens, num_experts, n_group, topk_group, topk)
+            for num_tokens in [1, 8, 32, 64, 128, 256, 496, 512, 16384]
+            for num_experts in [256]
+            for n_group in [8]
+            for topk_group in [4]
+            for topk in [8]
+            #(1, 64, 8, 2, 8),
+            #(8, 64, 8, 2, 8),
+            #(32, 64, 8, 2, 8),
+            #(64, 64, 8, 2, 8),
+            #(128, 64, 8, 2, 8),
+            #(256, 64, 8, 2, 8),
+            #(512, 64, 8, 2, 8),
+            #(1024, 64, 8, 2, 8),
+            #(2048, 64, 8, 2, 8),
+            #(32, 128, 8, 2, 8),
+            #(64, 128, 8, 2, 8),
+            #(128, 128, 8, 2, 8),
+            #(64, 64, 4, 2, 4),
+            #(64, 128, 16, 2, 8),
         ]
         self.shapes = grouped_topk_configs
 
@@ -71,7 +78,7 @@ class GroupedTopKBenchmark(base.Benchmark):
         num_tokens, num_experts, n_group, topk_group, topk = config
 
         scores = torch.randn(num_tokens, num_experts, device=device, dtype=dtype)
-        bias = torch.randn(num_experts, device=device, dtype=dtype)
+        bias = torch.randn(num_experts, device=device, dtype=torch.float32)
 
         yield (
             scores,
@@ -105,7 +112,7 @@ def test_grouped_topk_no_renorm():
     bench = GroupedTopKBenchmark(
         op_name="grouped_topk",
         torch_op=vllm_grouped_topk,
-        dtypes=[torch.float32, torch.bfloat16],
+        dtypes=[torch.bfloat16],
         renormalize=False,
         scoring_func=0,
     )
@@ -134,7 +141,7 @@ def test_grouped_topk_score_0():
     bench = GroupedTopKBenchmark(
         op_name="grouped_topk",
         torch_op=vllm_grouped_topk,
-        dtypes=[torch.float32, torch.bfloat16],
+        dtypes=[torch.bfloat16],
         renormalize=True,
         scoring_func=0,
     )
@@ -163,7 +170,7 @@ def test_grouped_topk_score_1():
     bench = GroupedTopKBenchmark(
         op_name="grouped_topk",
         torch_op=vllm_grouped_topk,
-        dtypes=[torch.float32, torch.bfloat16],
+        dtypes=[torch.bfloat16],
         renormalize=True,
         scoring_func=1,
     )
