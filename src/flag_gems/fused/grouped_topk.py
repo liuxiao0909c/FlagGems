@@ -273,6 +273,7 @@ def _unpack_val_idx_fp32(pair):
 
 @triton.jit
 def triton_grouped_topk_fused_small_expert_count_kernel(
+    token_id,
     scores_ptr,
     topk_values_ptr,
     topk_indices_ptr,
@@ -286,12 +287,12 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     renormalize,
     routed_scaling_factor,
     scores_stride0,
+    s_score_sigmoid_ptr,
     SCORING_FUNC: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
     neg_inf: tl.constexpr = float("-inf")
 
-    DUMP_FLAG = False # token_id == 1
+    DUMP_FLAG = False #token_id == 1
     scores_ptr += token_id * scores_stride0
     topk_values_ptr += token_id * topk
     topk_indices_ptr += token_id * topk
@@ -417,6 +418,110 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         tl.store(topk_indices_ptr + lane, top_idx, mask=lane < topk)
 
 
+@triton.jit
+def triton_persistent_grouped_topk(
+    scores_ptr,
+    topk_values_ptr,
+    topk_indices_ptr,
+    routing_bias_ptr,
+    num_tokens,
+    num_groups,
+    topk_group,
+    topk,
+    num_experts,
+    num_experts_per_group,
+    renormalize,
+    routed_scaling_factor,
+    scores_stride0,
+    SCORING_FUNC: tl.constexpr,
+    LAUNCH_GROUP_SIZE: tl.constexpr,
+):
+    NUM_WARPS: tl.constexpr = 8
+    WARP_SIZE: tl.constexpr = 32
+
+    s_score_sigmoid = tle.gpu.alloc(
+        [NUM_WARPS, WARP_SIZE],
+        dtype=tl.float32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_score_sigmoid_ptr = tle.gpu.local_ptr(s_score_sigmoid, (0, 0,))
+
+    launch_group_id = tl.program_id(0)
+    loop = tl.cdiv(num_tokens - launch_group_id, LAUNCH_GROUP_SIZE)
+    for t in tl.range(0, loop):
+        token_id = t * LAUNCH_GROUP_SIZE + launch_group_id
+        triton_grouped_topk_fused_small_expert_count_kernel(
+            token_id,
+            scores_ptr,
+            topk_values_ptr,
+            topk_indices_ptr,
+            routing_bias_ptr,
+            num_tokens,
+            num_groups,
+            topk_group,
+            topk,
+            num_experts,
+            num_experts_per_group,
+            renormalize,
+            routed_scaling_factor,
+            scores_stride0,
+            s_score_sigmoid_ptr,
+            SCORING_FUNC,
+        )
+
+
+@triton.jit
+def triton_non_persistent_grouped_topk(
+    scores_ptr,
+    topk_values_ptr,
+    topk_indices_ptr,
+    routing_bias_ptr,
+    num_tokens,
+    num_groups,
+    topk_group,
+    topk,
+    num_experts,
+    num_experts_per_group,
+    renormalize,
+    routed_scaling_factor,
+    scores_stride0,
+    SCORING_FUNC: tl.constexpr,
+):
+    NUM_WARPS: tl.constexpr = 8
+    WARP_SIZE: tl.constexpr = 32
+    
+    token_id = tl.program_id(0)
+    s_score_sigmoid = tle.gpu.alloc(
+        [NUM_WARPS, WARP_SIZE],
+        dtype=tl.float32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_score_sigmoid_ptr = tle.gpu.local_ptr(s_score_sigmoid, (0, 0,))
+
+    triton_grouped_topk_fused_small_expert_count_kernel(
+        token_id,
+        scores_ptr,
+        topk_values_ptr,
+        topk_indices_ptr,
+        routing_bias_ptr,
+        num_tokens,
+        num_groups,
+        topk_group,
+        topk,
+        num_experts,
+        num_experts_per_group,
+        renormalize,
+        routed_scaling_factor,
+        scores_stride0,
+        s_score_sigmoid_ptr,
+        SCORING_FUNC,
+    )
+
+
 def grouped_topk(
     scores: torch.Tensor,
     n_group: int,
@@ -474,7 +579,14 @@ def grouped_topk(
             device=scores.device,
             dtype=torch.int32,
         )
-        triton_grouped_topk_fused_small_expert_count_kernel[(num_tokens,)](
+        device = scores.device
+        device_props = torch.cuda.get_device_properties(device.index)
+        num_sms = device_props.multi_processor_count
+        max_threads_per_sms = device_props.max_threads_per_multi_processor
+        occupancy = max(1, max_threads_per_sms // 256)
+        launch_groups = min(num_sms * occupancy, num_tokens)
+        launch_groups = max(1, launch_groups)
+        triton_persistent_grouped_topk[(launch_groups,)](
             scores,
             topk_values,
             topk_indices,
@@ -489,6 +601,7 @@ def grouped_topk(
             routed_scaling_factor,
             scores.stride(0),
             SCORING_FUNC=scoring_func,
+            LAUNCH_GROUP_SIZE=launch_groups,
             num_warps=256 // 32,
         )
         return topk_values, topk_indices
