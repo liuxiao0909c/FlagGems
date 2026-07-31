@@ -287,92 +287,25 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     routed_scaling_factor,
     scores_stride0,
     SCORING_FUNC: tl.constexpr,
-    MESH: tl.constexpr,
-    CLUSTER_SIZE: tl.constexpr,
-    MAX_NUM_EXPERTS: tl.constexpr,
-    N_GROUPS_P: tl.constexpr,
 ):
-    cluster_pid = tl.program_id(0)
-    cluster_rank = tle.shard_id(MESH, "cluster_x")
-    token_id = cluster_pid // CLUSTER_SIZE
-    is_rank0 = cluster_rank == 0
-    valid_rank = cluster_rank < num_groups  # always true?
+    token_id = tl.program_id(0)
     neg_inf: tl.constexpr = float("-inf")
 
-    DUMP_FLAG = False #token_id == 2
+    DUMP_FLAG = False # token_id == 1
     scores_ptr += token_id * scores_stride0
     topk_values_ptr += token_id * topk
     topk_indices_ptr += token_id * topk
+    WARP_SIZE: tl.constexpr = 32
+    NUM_WARPS: tl.constexpr = 8
 
-    s_score_sigmoid = tle.gpu.alloc(
-        [32],
-        dtype=tl.float32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    s_score_bias = tle.gpu.alloc(
-        [32],
-        dtype=tl.float32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    s_group_scores = tle.gpu.alloc(
-        [N_GROUPS_P],
-        dtype=tl.float32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    s_top_group_idx = tle.gpu.alloc(
-        [4], # MAX_NUM_TOP_GROUPS
-        dtype=tl.int32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    s_expert_score_group = tle.gpu.alloc(
-        [32], # WARP_SIZE
-        dtype=tl.float32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    s_expert_idx_group = tle.gpu.alloc(
-        [32], # WARP_SIZE
-        dtype=tl.int32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    s_top_score_sigmoid = tle.gpu.alloc(
-        [8], # MAX_NUM_TOP_EXPERTS
-        dtype=tl.float32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
+    warps = tl.arange(0, NUM_WARPS)
+    lane = tl.arange(0, WARP_SIZE)
 
-    s_score_sigmoid_ptr = tle.gpu.local_ptr(s_score_sigmoid, (0,))
-    s_score_bias_ptr = tle.gpu.local_ptr(s_score_bias, (0,))
-    s_group_scores_ptr = tle.gpu.local_ptr(s_group_scores, (0,))
-    s_group_scores_rank0_ptr = tle.remote(s_group_scores_ptr, 0, scope=MESH)
-    s_top_group_idx_ptr = tle.gpu.local_ptr(s_top_group_idx, (0,))
-    s_top_group_idx_rank0_ptr = tle.remote(s_top_group_idx_ptr, 0, scope=MESH)
-    s_expert_score_group_ptr = tle.gpu.local_ptr(s_expert_score_group, (0,))
-    s_expert_score_group_rank0_ptr = tle.remote(s_expert_score_group_ptr, 0, scope=MESH)
-    s_expert_idx_group_ptr = tle.gpu.local_ptr(s_expert_idx_group, (0,))
-    s_expert_idx_group_rank0_ptr = tle.remote(s_expert_idx_group_ptr, 0, scope=MESH)
-    s_top_score_sigmoid_ptr = tle.gpu.local_ptr(s_top_score_sigmoid, (0,))
-    s_top_score_sigmoid_rank0_ptr = tle.remote(s_top_score_sigmoid_ptr, 0, scope=MESH)
-
-    # step1: load score/bias to smem
-    lane = tl.arange(0, 32)
-    zeros = tl.zeros([32], dtype=tl.int32)
+    # step1: load score/bias, get score_sigmoid/score_bias
+    offs = warps[:, None] * num_experts_per_group + lane[None, :]
     score = tl.load(
-        scores_ptr + num_experts_per_group * cluster_rank + lane,
-        mask=valid_rank & (lane < num_experts_per_group),
+        scores_ptr + offs,
+        mask=(warps[:, None] < num_groups) & (lane[None, :] < num_experts_per_group),
         other=neg_inf,
     ).to(tl.float32)
     if DUMP_FLAG:
@@ -381,129 +314,107 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         score_sigmoid = _sigmoid(score)
     else:
         score_sigmoid = score
-    if DUMP_FLAG:
-        tl.device_print("score_sigmoid:", score_sigmoid)
-    tl.store(s_score_sigmoid_ptr + lane, score_sigmoid, mask=valid_rank & (lane < num_experts_per_group))
+    s_score_sigmoid = tle.gpu.alloc(
+        [NUM_WARPS, WARP_SIZE],
+        dtype=tl.float32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_score_sigmoid_ptr = tle.gpu.local_ptr(s_score_sigmoid, (0, 0,))
+    tl.store(
+        s_score_sigmoid_ptr + offs,
+        score_sigmoid,
+        mask=(warps[:, None] < num_groups) & (lane[None, :] < num_experts_per_group),
+    )
+    #if DUMP_FLAG:
+    #    tl.device_print("score_sigmoid:", score_sigmoid)
 
     bias_val = tl.load(
-        routing_bias_ptr + num_experts_per_group * cluster_rank + lane,
-        mask=valid_rank & (lane < num_experts_per_group),
+        routing_bias_ptr + offs,
+        mask=(warps[:, None] < num_groups) & (lane[None, :] < num_experts_per_group),
         other=neg_inf,
     ).to(tl.float32)
     score_bias = score_sigmoid + bias_val
     if DUMP_FLAG:
         tl.device_print("score_bias:", score_bias)
-    tl.store(s_score_bias_ptr + lane, score_bias, mask=valid_rank & (lane < num_experts_per_group))
 
-    # step2: each rank get top2 as group_scores
+    # step2: get top2 as group_score
     MAX_IDX: tl.constexpr = 65535
-    min_val = tl.full((32,), neg_inf, dtype=tl.float32)
-    comp_val_idx = _pack_val_idx_fp32(score_bias, lane)
-    packed_max1 = tl.max(comp_val_idx)
+    min_val = tl.full((NUM_WARPS, WARP_SIZE,), neg_inf, dtype=tl.float32)
+    comp_val_idx = _pack_val_idx_fp32(score_bias, offs)
+    packed_max1 = tl.max(comp_val_idx, axis=-1) 
     val_max1, _1 = _unpack_val_idx_fp32(packed_max1)
     comp_val_idx = tl.where(
-        comp_val_idx == packed_max1,
-        _pack_val_idx_fp32(min_val, lane),
+        comp_val_idx == packed_max1[:, None],
+        _pack_val_idx_fp32(min_val, offs),
         comp_val_idx,
     )
-    packed_max2 = tl.max(comp_val_idx)
+    packed_max2 = tl.max(comp_val_idx, axis=-1)
     val_max2, _1 = _unpack_val_idx_fp32(packed_max2)
-    group_score = val_max1 + val_max2
-    if DUMP_FLAG:
-        tl.device_print("group_score:", group_score)
-    tl.store(s_group_scores_rank0_ptr + cluster_rank + zeros, group_score, mask=valid_rank & (lane == 0))
-    tle.distributed_barrier(MESH)
+    group_score = val_max1 + val_max2  # [NUM_WARPS]
+    #if DUMP_FLAG:
+    #    tl.device_print("group_score:", group_score)
 
-    # step3: rank0 get topk_group
-    if is_rank0:
-        group_scores = tl.load(s_group_scores_ptr + lane, mask=lane < num_groups, other=neg_inf)
-        if DUMP_FLAG:
-            tl.device_print("group_scores_gbl:", group_scores)
-        comp_val_idx = _pack_val_idx_fp32(group_scores, lane)
-        for t in tl.range(0, topk_group):
-            packed_max = tl.max(comp_val_idx)
-            comp_val_idx = tl.where(
-                comp_val_idx == packed_max,
-                _pack_val_idx_fp32(min_val, lane),
-                comp_val_idx,
-            )
-            _, top_group_idx = _unpack_val_idx_fp32(packed_max)
-            if DUMP_FLAG:
-                tl.device_print("top_group_idx:", top_group_idx)
-            tl.store(s_top_group_idx_ptr + t + zeros, top_group_idx, mask=lane == t)
-    tle.distributed_barrier(MESH)
+    # step3: get topk_group
+    min_val2 = tl.full((NUM_WARPS,), neg_inf, dtype=tl.float32)
+    top_group_mask = tl.full((NUM_WARPS,), 0, dtype=tl.uint8)
+    comp_val_idx2 = _pack_val_idx_fp32(group_score, warps)
+    for t in tl.range(0, topk_group):
+        packed_max = tl.max(comp_val_idx2)
+        comp_val_idx2 = tl.where(
+            comp_val_idx2 == packed_max,
+            _pack_val_idx_fp32(min_val2, warps),
+            comp_val_idx2,
+        )
+        _2, top_group_idx = _unpack_val_idx_fp32(packed_max) # [1]
+        top_group_mask = tl.where(warps == top_group_idx, 1, top_group_mask)
+    #if DUMP_FLAG:
+    #    tl.device_print("top_group_mask:", top_group_mask)
 
-    # step4: each topk_group(<=4) get topk(<=8), also copy score_sigmoid
-    if valid_rank:
-        top_group_idx_gbl = tl.load(s_top_group_idx_rank0_ptr + lane, mask=lane < topk_group, other=MAX_IDX)
-        group_idx_match = top_group_idx_gbl == cluster_rank
-        top_group_idx_gbl = tl.where(group_idx_match, lane, MAX_IDX)
-        group_offset = tl.min(top_group_idx_gbl)
-        if group_offset < MAX_IDX:
-            if DUMP_FLAG:
-                tl.device_print("top_group_idx_gbl:", top_group_idx_gbl)
-            score_bias = tl.load(s_score_bias_ptr + lane, mask=valid_rank & (lane < num_experts_per_group), other=neg_inf) # TODO: just use previous score_bias?
-            idx = cluster_rank * num_experts_per_group + lane
-            comp_val_idx = _pack_val_idx_fp32(score_bias, idx)
-            for t in tl.range(0, topk):
-                packed_max = tl.max(comp_val_idx)
-                comp_val_idx = tl.where(
-                    comp_val_idx == packed_max,
-                    _pack_val_idx_fp32(min_val, idx),
-                    comp_val_idx,
-                )
-                top_val, top_idx = _unpack_val_idx_fp32(packed_max)
-                tl.store(s_expert_idx_group_rank0_ptr + group_offset * topk + t + zeros, top_idx, mask=lane == t)
-                tl.store(s_expert_score_group_rank0_ptr + group_offset * topk + t + zeros, top_val, mask=lane == t)
-    tle.distributed_barrier(MESH)
+    # step4: get topk
+    top_idx = tl.full((WARP_SIZE,), 256, dtype=tl.uint32)
+    top_group_score_bias = tl.where(top_group_mask[:, None], score_bias, neg_inf)
+    comp_val_idx3 = _pack_val_idx_fp32(top_group_score_bias, offs)
+    for t in tl.range(0, topk):
+        packed_max3 = tl.max(comp_val_idx3)
+        comp_val_idx3 = tl.where(
+            comp_val_idx3 == packed_max3,
+            _pack_val_idx_fp32(min_val, offs),
+            comp_val_idx3,
+        )
+        _3, top_expert_idx = _unpack_val_idx_fp32(packed_max3)  # [1]
+        top_idx = tl.where(lane == t, top_expert_idx, top_idx)
+    #if DUMP_FLAG:
+    #    tl.device_print("top_idx:", top_idx)
 
-    # step5: rank0 get final topk, just use tl.sort, not array of 4 like cuda
-    if is_rank0:
-        top_idxs = tl.load(s_expert_idx_group_ptr + lane, mask=lane < topk_group * topk, other=MAX_IDX)
-        top_vals = tl.load(s_expert_score_group_ptr + lane, mask=lane < topk_group * topk, other=neg_inf)
-        comp_val_idx = _pack_val_idx_fp32(top_vals, top_idxs)
-        comp_val_idx = tl.sort(comp_val_idx, dim=0, descending=True)
-        _, top_idxs = _unpack_val_idx_fp32(comp_val_idx)
-        if DUMP_FLAG:
-            tl.device_print("top_idxs:", top_idxs)
-        tl.store(s_expert_idx_group_ptr + lane, top_idxs, mask=lane < topk)
-    tle.distributed_barrier(MESH)
-
-    if renormalize:
-        # step6_1: copy score_sigmoid for tl.sum
-        if valid_rank:
-            top_idxs_gbl = tl.load(s_expert_idx_group_rank0_ptr + lane, mask=lane < topk, other=MAX_IDX)
-            top_idxs_local = top_idxs_gbl - cluster_rank * num_experts_per_group
-            mask = (top_idxs_local >= 0) & (top_idxs_local < num_experts_per_group)
-            # output topk_indices
-            tl.store(topk_indices_ptr + lane, top_idxs_gbl, mask=valid_rank & mask)
-            score_norm_local = tl.load(s_score_sigmoid_ptr + top_idxs_local, mask=valid_rank & mask, other=0.0)
-            if DUMP_FLAG:
-                tl.device_print("top_idxs_gbl:", top_idxs_gbl)
-                tl.device_print("top_idxs_gbl_mask:", valid_rank & mask)
-                tl.device_print("score_norm_local:", score_norm_local)
-            tl.store(s_top_score_sigmoid_rank0_ptr + lane, score_norm_local, mask=valid_rank & mask)
-        tle.distributed_barrier(MESH)
-        # step7: rank0 output
-        if is_rank0:
-            score_norm_gbl = tl.load(s_top_score_sigmoid_ptr + lane, mask=lane < topk, other=0.0)
-            red_norm = tl.sum(score_norm_gbl)
-            final_score = score_norm_gbl / (red_norm + 1e-20)
-            # output topk_values
-            tl.store(topk_values_ptr + lane, final_score, mask=lane < topk)
-            if DUMP_FLAG:
-                tl.device_print("score_norm_gbl:", score_norm_gbl)
-                tl.device_print("final_score:", final_score)
-    else:
-        if valid_rank:
-            top_idxs_gbl = tl.load(s_expert_idx_group_rank0_ptr + lane, mask=lane < topk, other=MAX_IDX)
-            top_idxs_local = top_idxs_gbl - cluster_rank * num_experts_per_group
-            mask = (top_idxs_local >= 0) & (top_idxs_local < num_experts_per_group)
-            # output topk_indices
-            tl.store(topk_indices_ptr + lane, top_idxs_gbl, mask=valid_rank & mask)
-            score_norm_local = tl.load(s_score_sigmoid_ptr + top_idxs_local, mask=valid_rank & mask, other=0.0)
-            # output topk_values
-            tl.store(topk_values_ptr + lane, score_norm_local, mask=valid_rank & mask)
+    # step5: renormalize and output
+    if False: # vllm grouped_topk_fused_small_expert_count_kernel path
+        score_norm = tl.load(s_score_sigmoid_ptr + top_idx, mask=lane < topk, other=0.0)
+        final_score = score_norm * routed_scaling_factor
+        if renormalize:
+            red_norm = tl.sum(final_score)
+            final_score /= (red_norm + 1e-20)
+        tl.store(topk_values_ptr + lane, final_score, mask=lane < topk)
+        tl.store(topk_indices_ptr + lane, top_idx, mask=lane < topk)
+    elif True: # vllm grouped_topk_fused_kernel
+        lane_unbiased = tl.load(s_score_sigmoid_ptr + top_idx, mask=lane < topk, other=0.0)
+        topk_sum = 1e-20
+        if renormalize:
+            topk_sum += tl.sum(lane_unbiased)
+        scale = routed_scaling_factor.to(tl.float32)
+        if renormalize:
+            scale /= topk_sum
+        tl.store(topk_values_ptr + lane, lane_unbiased * scale, mask=lane < topk)
+        tl.store(topk_indices_ptr + lane, top_idx, mask=lane < topk)
+    else: # vllm torch version in vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py
+        top_weights = tl.load(s_score_sigmoid_ptr + top_idx, mask=lane < topk, other=0.0)
+        if renormalize:
+            top_weights = top_weights / tl.sum(top_weights)
+        if routed_scaling_factor != 1.0:
+            top_weights = top_weights * routed_scaling_factor
+        tl.store(topk_values_ptr + lane, top_weights, mask=lane < topk)
+        tl.store(topk_indices_ptr + lane, top_idx, mask=lane < topk)
 
 
 def grouped_topk(
@@ -563,8 +474,6 @@ def grouped_topk(
             device=scores.device,
             dtype=torch.int32,
         )
-        TLE_SMEM_CLUSTER_SIZE = n_group
-        BLOCK_CLUSTER_MESH = tle.device_mesh({"block_cluster": [("cluster_x", TLE_SMEM_CLUSTER_SIZE)]})
         triton_grouped_topk_fused_small_expert_count_kernel[(num_tokens,)](
             scores,
             topk_values,
@@ -580,11 +489,7 @@ def grouped_topk(
             routed_scaling_factor,
             scores.stride(0),
             SCORING_FUNC=scoring_func,
-            MESH=BLOCK_CLUSTER_MESH,
-            CLUSTER_SIZE=TLE_SMEM_CLUSTER_SIZE,
-            MAX_NUM_EXPERTS=256,
-            N_GROUPS_P=triton.next_power_of_2(n_group),
-            num_warps=TLE_SMEM_CLUSTER_SIZE,
+            num_warps=256 // 32,
         )
         return topk_values, topk_indices
 
