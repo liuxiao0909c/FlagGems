@@ -255,7 +255,7 @@ def _pack_val_idx_fp32(val, idx):
     MAX_IDX: tl.constexpr = 0xFFFF
     bits = val.to(tl.uint32, bitcast=True)
     sign_bit = tl.full(val.shape, 0x80000000, tl.uint32)
-    high = tl.where(bits & sign_bit, ~bits, bits | sign_bit).to(tl.uint64) << 32
+    high = tl.where((bits & sign_bit) > 0, ~bits, bits | sign_bit).to(tl.uint64) << 32
     low = (0xFFFF & (MAX_IDX - idx)).to(tl.uint64)
     return high | low
 
@@ -374,7 +374,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
 
     # step4: get topk
     top_idx = tl.full((WARP_SIZE,), 256, dtype=tl.uint32)
-    top_group_score_bias = tl.where(top_group_mask[:, None], score_bias, neg_inf)
+    top_group_score_bias = tl.where(top_group_mask[:, None] > 0, score_bias, neg_inf)
     comp_val_idx3 = _pack_val_idx_fp32(top_group_score_bias, offs)
     for t in tl.range(0, topk):
         packed_max3 = tl.max(comp_val_idx3)
