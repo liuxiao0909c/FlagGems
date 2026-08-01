@@ -297,6 +297,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     topk_indices_ptr += token_id * topk
     WARP_SIZE: tl.constexpr = 32
     NUM_WARPS: tl.constexpr = 8
+    MAX_NUM_TOP_EXPERTS: tl.constexpr = 8
 
     s_score_sigmoid = tle.gpu.alloc(
         [NUM_WARPS, WARP_SIZE],
@@ -312,8 +313,16 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
+    s_top_experts = tle.gpu.alloc(
+        [MAX_NUM_TOP_EXPERTS],
+        dtype=tl.uint32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
     s_score_sigmoid_ptr = tle.gpu.local_ptr(s_score_sigmoid, (0, 0,))
     s_score_bias_ptr = tle.gpu.local_ptr(s_score_bias, (0, 0,))
+    s_top_experts_ptr = tle.gpu.local_ptr(s_top_experts, (0,))
 
     warps = tl.arange(0, NUM_WARPS)
     lane = tl.arange(0, WARP_SIZE)
@@ -440,7 +449,8 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     comp_val_idx21, comp_val_idx22 = max(comp_val_idx21, comp_val_idx22), min(comp_val_idx21, comp_val_idx22)
 
     min_val2 = tl.full((WARP_SIZE,), neg_inf, dtype=tl.float32)
-    top_experts = tl.full((WARP_SIZE,), MAX_IDX, dtype=tl.uint32)
+    #top_experts = tl.full((WARP_SIZE,), MAX_IDX, dtype=tl.uint32)
+    zeros = tl.zeros([WARP_SIZE], dtype=tl.uint32)
     packed_max20 = tl.full((), 0, dtype=tl.uint64)
     for kk in tl.static_range(0, topk):
         update = (kk > 0) & (comp_val_idx20 == packed_max20)
@@ -466,7 +476,9 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         )
         packed_max20 = tl.max(comp_val_idx20)
         _3, out_idx = _unpack_val_idx_fp32(packed_max20)
-        top_experts = tl.where(lane == kk, out_idx, top_experts)
+        tl.store(s_top_experts_ptr + kk + zeros, out_idx, mask=lane == kk)
+        #top_experts = tl.where(lane == kk, out_idx, top_experts)
+    top_experts = tl.load(s_top_experts_ptr + lane, mask=lane < topk)
     if DUMP_FLAG:
         tl.device_print("top_experts:", top_experts)
 
