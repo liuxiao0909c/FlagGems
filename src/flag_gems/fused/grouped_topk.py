@@ -356,13 +356,12 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     # step2: get top2 as group_score
     MAX_IDX: tl.constexpr = 65535
     min_val0 = tl.full((NUM_WARPS, WARP_SIZE,), neg_inf, dtype=tl.float32)
-    my_min = tl.full((), 0xFF800000, dtype=tl.uint32).to(tl.uint64)
     comp_val_idx0 = _pack_val_idx_fp32(score_bias, offs)
     packed_max00 = tl.max(comp_val_idx0, axis=-1)
     val_max0, _0 = _unpack_val_idx_fp32(packed_max00)
     comp_val_idx0 = tl.where(
         comp_val_idx0 == packed_max00[:, None],
-        my_min[None, None],#_pack_val_idx_fp32(min_val0, offs),
+        _pack_val_idx_fp32(min_val0, offs),
         comp_val_idx0,
     )
     packed_max01 = tl.max(comp_val_idx0, axis=-1)
@@ -378,21 +377,21 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     _2, group_idx0 = _unpack_val_idx_fp32(packed_max10)
     comp_val_idx1 = tl.where(
         comp_val_idx1 == packed_max10,
-        my_min[None],#_pack_val_idx_fp32(min_val1, warps),
+        _pack_val_idx_fp32(min_val1, warps),
         comp_val_idx1,
     )
     packed_max11 = tl.max(comp_val_idx1)
     _2, group_idx1 = _unpack_val_idx_fp32(packed_max11)
     comp_val_idx1 = tl.where(
         comp_val_idx1 == packed_max11,
-        my_min[None],#_pack_val_idx_fp32(min_val1, warps),
+        _pack_val_idx_fp32(min_val1, warps),
         comp_val_idx1,
     )
     packed_max12 = tl.max(comp_val_idx1)
     _2, group_idx2 = _unpack_val_idx_fp32(packed_max12)
     comp_val_idx1 = tl.where(
         comp_val_idx1 == packed_max12,
-        my_min[None],#_pack_val_idx_fp32(min_val1, warps),
+        _pack_val_idx_fp32(min_val1, warps),
         comp_val_idx1,
     )
     packed_max13 = tl.max(comp_val_idx1)
@@ -462,7 +461,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         )
         comp_val_idx23 = tl.where(
             update,
-            my_min[None],#_pack_val_idx_fp32(min_val2, expert_idx_group3),
+            _pack_val_idx_fp32(min_val2, expert_idx_group3),
             comp_val_idx23,
         )
         packed_max20 = tl.max(comp_val_idx20)
