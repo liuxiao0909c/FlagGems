@@ -297,7 +297,6 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     topk_indices_ptr += token_id * topk
     WARP_SIZE: tl.constexpr = 32
     NUM_WARPS: tl.constexpr = 8
-    MAX_NUM_TOP_EXPERTS: tl.constexpr = 8
 
     s_score_sigmoid = tle.gpu.alloc(
         [NUM_WARPS, WARP_SIZE],
@@ -318,7 +317,6 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
 
     warps = tl.arange(0, NUM_WARPS)
     lane = tl.arange(0, WARP_SIZE)
-    expert_offs = tl.arange(0, MAX_NUM_TOP_EXPERTS)
 
     # step1: load score/bias, get score_sigmoid/score_bias
     offs = warps[:, None] * num_experts_per_group + lane[None, :]
@@ -442,7 +440,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     comp_val_idx21, comp_val_idx22 = max(comp_val_idx21, comp_val_idx22), min(comp_val_idx21, comp_val_idx22)
 
     min_val2 = tl.full((WARP_SIZE,), neg_inf, dtype=tl.float32)
-    top_experts = tl.full((MAX_NUM_TOP_EXPERTS,), MAX_IDX, dtype=tl.uint32)
+    top_experts = tl.full((WARP_SIZE,), MAX_IDX, dtype=tl.uint32)
     packed_max20 = tl.full((), 0, dtype=tl.uint64)
     for kk in tl.static_range(0, topk):
         update = (kk > 0) & (comp_val_idx20 == packed_max20)
@@ -468,37 +466,37 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         )
         packed_max20 = tl.max(comp_val_idx20)
         _3, out_idx = _unpack_val_idx_fp32(packed_max20)
-        top_experts = tl.where(expert_offs == kk, out_idx, top_experts)
+        top_experts = tl.where(lane == kk, out_idx, top_experts)
     if DUMP_FLAG:
         tl.device_print("top_experts:", top_experts)
 
     # step5: renormalize and output
     if False: # vllm grouped_topk_fused_small_expert_count_kernel path
-        score_norm = tl.load(s_score_sigmoid_ptr + top_experts, mask=expert_offs < topk, other=0.0)
+        score_norm = tl.load(s_score_sigmoid_ptr + top_experts, mask=lane < topk, other=0.0)
         final_score = score_norm * routed_scaling_factor
         if renormalize:
             red_norm = tl.sum(final_score)
             final_score /= (red_norm + 1e-20)
-        tl.store(topk_values_ptr + expert_offs, final_score, mask=lane < topk)
-        tl.store(topk_indices_ptr + expert_offs, top_experts, mask=lane < topk)
+        tl.store(topk_values_ptr + lane, final_score, mask=lane < topk)
+        tl.store(topk_indices_ptr + lane, top_experts, mask=lane < topk)
     elif True: # vllm grouped_topk_fused_kernel
-        lane_unbiased = tl.load(s_score_sigmoid_ptr + top_experts, mask=expert_offs < topk, other=0.0)
+        lane_unbiased = tl.load(s_score_sigmoid_ptr + top_experts, mask=lane < topk, other=0.0)
         topk_sum = 1e-20
         if renormalize:
             topk_sum += tl.sum(lane_unbiased)
         scale = routed_scaling_factor.to(tl.float32)
         if renormalize:
             scale /= topk_sum
-        tl.store(topk_values_ptr + expert_offs, lane_unbiased * scale, mask=expert_offs < topk)
-        tl.store(topk_indices_ptr + expert_offs, top_experts, mask=expert_offs < topk)
+        tl.store(topk_values_ptr + lane, lane_unbiased * scale, mask=lane < topk)
+        tl.store(topk_indices_ptr + lane, top_experts, mask=lane < topk)
     else: # vllm torch version in vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py
-        top_weights = tl.load(s_score_sigmoid_ptr + top_experts, mask=expert_offs < topk, other=0.0)
+        top_weights = tl.load(s_score_sigmoid_ptr + top_experts, mask=lane < topk, other=0.0)
         if renormalize:
             top_weights = top_weights / tl.sum(top_weights)
         if routed_scaling_factor != 1.0:
             top_weights = top_weights * routed_scaling_factor
-        tl.store(topk_values_ptr + expert_offs, top_weights, mask=expert_offs < topk)
-        tl.store(topk_indices_ptr + expert_offs, top_experts, mask=expert_offs < topk)
+        tl.store(topk_values_ptr + lane, top_weights, mask=lane < topk)
+        tl.store(topk_indices_ptr + lane, top_experts, mask=lane < topk)
 
 
 def grouped_topk(
