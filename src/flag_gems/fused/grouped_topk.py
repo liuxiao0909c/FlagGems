@@ -254,8 +254,7 @@ def _sigmoid(x):
 def _pack_val_idx_fp32(val, idx):
     MAX_IDX: tl.constexpr = 0xFFFF
     bits = val.to(tl.uint32, bitcast=True)
-    sign_bit = tl.full(val.shape, 0x80000000, tl.uint32)
-    high = tl.where((bits & sign_bit) > 0, ~bits, bits | sign_bit).to(tl.uint64) << 32
+    high = tl.where((bits & 0x80000000) != 0, ~bits, bits | 0x80000000).to(tl.uint64) << 32
     low = (0xFFFF & (MAX_IDX - idx)).to(tl.uint64)
     return high | low
 
@@ -264,9 +263,8 @@ def _pack_val_idx_fp32(val, idx):
 def _unpack_val_idx_fp32(pair):
     MAX_IDX: tl.constexpr = 0xFFFF
     idx = (MAX_IDX - (pair & 0xFFFF)).to(tl.uint32)
-    sign_bit = tl.full(pair.shape, 0x80000000, tl.uint32)
     enc = (pair >> 32).to(tl.uint32)
-    bits = tl.where(enc >= sign_bit, enc ^ sign_bit, ~enc)
+    bits = tl.where((enc & 0x80000000) != 0, enc ^ 0x80000000, ~enc)
     val = bits.to(tl.float32, bitcast=True)
     return val, idx
 
