@@ -48,20 +48,6 @@ else:
     DTYPE_LIST = [torch.bfloat16, torch.float32]
 
 
-vendor_name = flag_gems.vendor_name
-
-try:
-    if vendor_name == "metax":
-        from vllm_metax._custom_ops import grouped_topk as vllm_grouped_topk
-    else:
-        from vllm._custom_ops import grouped_topk as vllm_grouped_topk
-
-    HAS_VLLM = True
-except (ImportError, AttributeError):
-    HAS_VLLM = False
-    vllm_grouped_topk = None
-
-
 @torch.compile(
     dynamic=True,
     backend="inductor",
@@ -117,6 +103,22 @@ def torch_grouped_topk(
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+vendor_name = flag_gems.vendor_name
+
+try:
+    if vendor_name == "metax":
+        from vllm_metax._custom_ops import grouped_topk as vllm_grouped_topk
+    elif vendor_name == "mthreads" or vendor_name == "hygon" or vendor_name == "ascend":
+        vllm_grouped_topk = torch_grouped_topk
+    else:
+        from vllm._custom_ops import grouped_topk as vllm_grouped_topk
+
+    HAS_VLLM = True
+except (ImportError, AttributeError):
+    HAS_VLLM = False
+    vllm_grouped_topk = None
 
 
 def get_tolerance(dtype, scoring_func, renormalize):
