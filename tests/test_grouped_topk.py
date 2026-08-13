@@ -101,9 +101,8 @@ def torch_grouped_topk(
     tmp_group_ids = torch.arange(0, num_expert_group, dtype=torch.int32, device=scores.device)
     tmp_group_ids = tmp_group_ids[None, :].expand(num_token, -1)
     group_pairs = _pack_val_idx_fp32(group_scores, tmp_group_ids)
-    top_group_pairs = torch.topk(group_pairs, k=topk_group, dim=-1, sorted=use_sorted)[0] 
+    top_group_pairs = torch.topk(group_pairs, k=topk_group, dim=-1, sorted=use_sorted)[0]
     _top_group_scores, group_idx = _unpack_val_idx_fp32(top_group_pairs) # [n, top_k_group]
-
     group_mask = torch.zeros_like(group_scores)  # [n, n_group]
     group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
     score_mask = (
@@ -112,7 +111,6 @@ def torch_grouped_topk(
         .reshape(num_token, -1)
     )  # [n, e]
     tmp_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
-
     tmp_ids = torch.arange(0, scores.size(1), dtype=torch.int32, device=scores.device)
     tmp_ids = tmp_ids[None, :].expand(num_token, -1)
     pairs = _pack_val_idx_fp32(tmp_scores, tmp_ids)
