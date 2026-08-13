@@ -127,7 +127,6 @@ def torch_grouped_topk(
         top_pairs = torch.topk(pairs.cpu(), k=topk, dim=-1, sorted=use_sorted)[0].to(scores.device)
     else:
         top_pairs = torch.topk(pairs, k=topk, dim=-1, sorted=use_sorted)[0]
-    top_pairs = torch.topk(pairs, k=topk, dim=-1, sorted=use_sorted)[0]
     if bias is not None:
         _, topk_ids = _unpack_val_idx_fp32(top_pairs)
         topk_weights = original_scores.gather(1, topk_ids)
