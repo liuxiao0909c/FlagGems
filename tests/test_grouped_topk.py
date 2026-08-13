@@ -70,7 +70,7 @@ def _unpack_val_idx_fp32(pair: torch.Tensor):
     bits = torch.where(sign != 0, key ^ SIGN_MASK_INT64, key).to(torch.int32)
     bits = torch.where(sign != 0, bits, ~bits)
     val = bits.view(torch.float32)
-    idx = (MAX_IDX - (pair & 0xFFFF)).to(torch.int32)
+    idx = (MAX_IDX - (pair & 0xFFFF)).to(torch.int64)
     return val, idx
 
 
@@ -84,7 +84,10 @@ def torch_grouped_topk(
     bias: torch.Tensor,
     scoring_func: int = 0,
 ):
-    """Adapted from vLLM: vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py"""
+    """
+    Adapted from vLLM: vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py
+    Wrap torch.topk with packing and unpacking logic to fix stability issues.
+    """
     scores = scores.float()
     if scoring_func == 1:
         scores = scores.sigmoid()
@@ -97,10 +100,14 @@ def torch_grouped_topk(
     )
 
     use_sorted = True
-    # torch.topk is not stable, pack with id before topk
     tmp_group_ids = torch.arange(0, num_expert_group, dtype=torch.int32, device=scores.device)
     tmp_group_ids = tmp_group_ids[None, :].expand(num_token, -1)
     group_pairs = _pack_val_idx_fp32(group_scores, tmp_group_ids)
+    if vendor_name == "mthreads":
+        # muDNN(v3105): ERROR# INVALID_PARAMETER in TopK::Run, Reason: Unsupported in data type: INT64
+        top_group_pairs = torch.topk(group_pairs.cpu(), k=topk_group, dim=-1, sorted=use_sorted)[0].to(scores.device)
+    else:
+        top_group_pairs = torch.topk(group_pairs, k=topk_group, dim=-1, sorted=use_sorted)[0]
     top_group_pairs = torch.topk(group_pairs, k=topk_group, dim=-1, sorted=use_sorted)[0]
     _top_group_scores, group_idx = _unpack_val_idx_fp32(top_group_pairs) # [n, top_k_group]
     group_mask = torch.zeros_like(group_scores)  # [n, n_group]
@@ -111,9 +118,15 @@ def torch_grouped_topk(
         .reshape(num_token, -1)
     )  # [n, e]
     tmp_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
+
     tmp_ids = torch.arange(0, scores.size(1), dtype=torch.int32, device=scores.device)
     tmp_ids = tmp_ids[None, :].expand(num_token, -1)
     pairs = _pack_val_idx_fp32(tmp_scores, tmp_ids)
+    if vendor_name == "mthreads":
+        # muDNN(v3105): ERROR# INVALID_PARAMETER in TopK::Run, Reason: Unsupported in data type: INT64
+        top_pairs = torch.topk(pairs.cpu(), k=topk, dim=-1, sorted=use_sorted)[0].to(scores.device)
+    else:
+        top_pairs = torch.topk(pairs, k=topk, dim=-1, sorted=use_sorted)[0]
     top_pairs = torch.topk(pairs, k=topk, dim=-1, sorted=use_sorted)[0]
     if bias is not None:
         _, topk_ids = _unpack_val_idx_fp32(top_pairs)

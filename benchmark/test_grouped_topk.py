@@ -20,31 +20,6 @@ import flag_gems
 from . import base, utils
 
 
-MAX_IDX = 0xFFFF
-SIGN_MASK_INT32 = torch.tensor(0x80000000, dtype=torch.uint32).view(torch.int32)
-SIGN_MASK_INT64 = torch.tensor(0x80000000, dtype=torch.int64)
-
-
-def _pack_val_idx_fp32(val: torch.Tensor, idx: torch.Tensor):
-    bits = val.view(torch.int32)
-    sign = bits & SIGN_MASK_INT32
-    key = torch.where(sign != 0, ~bits, bits).to(torch.int64)
-    key = torch.where(sign != 0, key, key | SIGN_MASK_INT64)
-    high = key << 16
-    low = (0xFFFF & (MAX_IDX - idx)).to(torch.int64)
-    return high | low
-
-
-def _unpack_val_idx_fp32(pair: torch.Tensor):
-    key = pair >> 16
-    sign = key & SIGN_MASK_INT64
-    bits = torch.where(sign != 0, key ^ SIGN_MASK_INT64, key).to(torch.int32)
-    bits = torch.where(sign != 0, bits, ~bits)
-    val = bits.view(torch.float32)
-    idx = (MAX_IDX - (pair & 0xFFFF)).to(torch.int32)
-    return val, idx
-
-
 def torch_grouped_topk(
     scores: torch.Tensor,
     num_expert_group: int,
@@ -55,7 +30,10 @@ def torch_grouped_topk(
     bias: torch.Tensor,
     scoring_func: int = 0,
 ):
-    """Adapted from vLLM: vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py"""
+    """
+    Adapted from vLLM: vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py.
+    Ignore the non-stablility of torch.topk in benchmark test.
+    """
     scores = scores.float()
     if scoring_func == 1:
         scores = scores.sigmoid()
@@ -68,12 +46,9 @@ def torch_grouped_topk(
     )
 
     use_sorted = True
-    # torch.topk is not stable, pack with id before topk
-    tmp_group_ids = torch.arange(0, num_expert_group, dtype=torch.int32, device=scores.device)
-    tmp_group_ids = tmp_group_ids[None, :].expand(num_token, -1)
-    group_pairs = _pack_val_idx_fp32(group_scores, tmp_group_ids)
-    top_group_pairs = torch.topk(group_pairs, k=topk_group, dim=-1, sorted=use_sorted)[0]
-    _top_group_scores, group_idx = _unpack_val_idx_fp32(top_group_pairs) # [n, top_k_group]
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=use_sorted)[
+        1
+    ]  # [n, top_k_group]
     group_mask = torch.zeros_like(group_scores)  # [n, n_group]
     group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
     score_mask = (
@@ -82,15 +57,15 @@ def torch_grouped_topk(
         .reshape(num_token, -1)
     )  # [n, e]
     tmp_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
-    tmp_ids = torch.arange(0, scores.size(1), dtype=torch.int32, device=scores.device)
-    tmp_ids = tmp_ids[None, :].expand(num_token, -1)
-    pairs = _pack_val_idx_fp32(tmp_scores, tmp_ids)
-    top_pairs = torch.topk(pairs, k=topk, dim=-1, sorted=use_sorted)[0]
+
     if bias is not None:
-        _, topk_ids = _unpack_val_idx_fp32(top_pairs)
+        topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=use_sorted)[1]
+        # Use original unbiased scores for the routing weights
         topk_weights = original_scores.gather(1, topk_ids)
     else:
-        topk_weights, topk_ids = _unpack_val_idx_fp32(top_pairs)
+        topk_weights, topk_ids = torch.topk(
+            tmp_scores, k=topk, dim=-1, sorted=use_sorted
+        )
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
