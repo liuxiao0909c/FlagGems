@@ -180,7 +180,7 @@ class GroupedTopKBenchmark(base.Benchmark):
 def test_grouped_topk_no_renorm():
     bench = GroupedTopKBenchmark(
         op_name="grouped_topk",
-        torch_op=vllm_grouped_topk,
+        torch_op=ref_grouped_topk,
         dtypes=[torch.bfloat16],
         renormalize=False,
         scoring_func=0,
@@ -197,7 +197,7 @@ def test_grouped_topk_no_renorm():
 def test_grouped_topk_score_0():
     bench = GroupedTopKBenchmark(
         op_name="grouped_topk",
-        torch_op=vllm_grouped_topk,
+        torch_op=ref_grouped_topk,
         dtypes=[torch.bfloat16],
         renormalize=True,
         scoring_func=0,
@@ -214,7 +214,7 @@ def test_grouped_topk_score_0():
 def test_grouped_topk_score_1():
     bench = GroupedTopKBenchmark(
         op_name="grouped_topk",
-        torch_op=vllm_grouped_topk,
+        torch_op=ref_grouped_topk,
         dtypes=[torch.bfloat16],
         renormalize=True,
         scoring_func=1,
