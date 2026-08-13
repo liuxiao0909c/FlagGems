@@ -20,6 +20,7 @@ import triton.language as tl
 
 from flag_gems.utils import tl_extra_shim
 from flag_gems.utils.triton_version_utils import has_triton_tle
+from flag_gems.runtime import device as runtime_device
 
 if has_triton_tle(3, 6, 0):
     try:
@@ -34,6 +35,7 @@ else:
     HAS_TLE = False
 
 
+SUPPORT_UINT64 = False if runtime_device.vendor_name == "ascend" else True
 logger = logging.getLogger(__name__)
 
 
@@ -265,23 +267,44 @@ def _sigmoid(x):
 
 
 @triton.jit
-def _pack_val_idx_fp32(val, idx):
+def _pack_val_idx_fp32(val, idx, SUPPORT_UINT64: tl.constexpr):
     MAX_IDX: tl.constexpr = 0xFFFF
+    SIGN_MASK_UINT32: tl.constexpr = tl.cast(0x80000000, tl.uint32)
     bits = val.to(tl.uint32, bitcast=True)
-    key = tl.where((bits & 0x80000000) != 0, ~bits, bits | 0x80000000)
-    high = key.to(tl.uint64) << 32
-    low = (0xFFFF & (MAX_IDX - idx)).to(tl.uint64)
-    return high | low
+    sign = bits & SIGN_MASK_UINT32
+    if SUPPORT_UINT64:
+        key = tl.where(sign != 0, ~bits, bits | SIGN_MASK_UINT32)
+        high = key.to(tl.uint64) << 32
+        low = (0xFFFF & (MAX_IDX - idx)).to(tl.uint64)
+        return high | low
+    else:
+        SIGN_MASK_INT64: tl.constexpr = tl.cast(0x80000000, tl.int64)
+        key = tl.where(sign != 0, ~bits, bits).to(tl.int64)
+        key = tl.where(sign != 0, key, key | SIGN_MASK_INT64)
+        high = key << 16
+        low = (0xFFFF & (MAX_IDX - idx)).to(tl.int64)
+        return high | low
 
 
 @triton.jit
-def _unpack_val_idx_fp32(pair):
+def _unpack_val_idx_fp32(pair, SUPPORT_UINT64: tl.constexpr):
     MAX_IDX: tl.constexpr = 0xFFFF
-    key = (pair >> 32).to(tl.uint32)
-    idx = (MAX_IDX - (pair & 0xFFFF)).to(tl.uint32)
-    bits = tl.where((key & 0x80000000) != 0, key ^ 0x80000000, ~key)
-    val = bits.to(tl.float32, bitcast=True)
-    return val, idx
+    if SUPPORT_UINT64:
+        SIGN_MASK_UINT32: tl.constexpr = tl.cast(0x80000000, tl.uint32)
+        key = (pair >> 32).to(tl.uint32)
+        idx = (MAX_IDX - (pair & 0xFFFF)).to(tl.uint32)
+        bits = tl.where((key & SIGN_MASK_UINT32) != 0, key ^ SIGN_MASK_UINT32, ~key)
+        val = bits.to(tl.float32, bitcast=True)
+        return val, idx
+    else:
+        SIGN_MASK_INT64: tl.constexpr = tl.cast(0x80000000, tl.int64)
+        key = pair >> 16
+        sign = key & SIGN_MASK_INT64
+        bits = tl.where(sign != 0, key ^ SIGN_MASK_INT64, key).to(tl.uint32)
+        bits = tl.where(sign != 0, bits, ~bits)
+        val = bits.to(tl.float32, bitcast=True)
+        idx = (MAX_IDX - (pair & 0xFFFF)).to(tl.uint32)
+        return val, idx
 
 
 # Adapted from vLLM:
@@ -306,6 +329,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     g_score_bias_ptr,
     SCORING_FUNC: tl.constexpr,
     HAS_TLE: tl.constexpr,
+    SUPPORT_UINT64: tl.constexpr,
 ):
     WARP_SIZE: tl.constexpr = 32
     NUM_WARPS: tl.constexpr = 8
@@ -370,44 +394,44 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
 
     # step2: get top2 as group_score
     min_val0 = tl.full((NUM_WARPS, WARP_SIZE), neg_inf, dtype=tl.float32)
-    comp_val_idx0 = _pack_val_idx_fp32(score_bias, offs)
+    comp_val_idx0 = _pack_val_idx_fp32(score_bias, offs, SUPPORT_UINT64)
     packed_max00 = tl.max(comp_val_idx0, axis=-1)
-    val_max0, _0 = _unpack_val_idx_fp32(packed_max00)
+    val_max0, _0 = _unpack_val_idx_fp32(packed_max00, SUPPORT_UINT64)
     comp_val_idx0 = tl.where(
         comp_val_idx0 == packed_max00[:, None],
-        _pack_val_idx_fp32(min_val0, offs),
+        _pack_val_idx_fp32(min_val0, offs, SUPPORT_UINT64),
         comp_val_idx0,
     )
     packed_max01 = tl.max(comp_val_idx0, axis=-1)
-    val_max1, _0 = _unpack_val_idx_fp32(packed_max01)
+    val_max1, _0 = _unpack_val_idx_fp32(packed_max01, SUPPORT_UINT64)
     group_score = val_max0 + val_max1
 
     # step3: get topk_group, topk_group <= MAX_NUM_TOP_GROUPS, where MAX_NUM_TOP_GROUPS = 4
     min_val1 = tl.full((NUM_WARPS,), neg_inf, dtype=tl.float32)
-    comp_val_idx1 = _pack_val_idx_fp32(group_score, warps)
+    comp_val_idx1 = _pack_val_idx_fp32(group_score, warps, SUPPORT_UINT64)
     packed_max10 = tl.max(comp_val_idx1)
-    _2, group_idx0 = _unpack_val_idx_fp32(packed_max10)
+    _2, group_idx0 = _unpack_val_idx_fp32(packed_max10, SUPPORT_UINT64)
     comp_val_idx1 = tl.where(
         comp_val_idx1 == packed_max10,
-        _pack_val_idx_fp32(min_val1, warps),
+        _pack_val_idx_fp32(min_val1, warps, SUPPORT_UINT64),
         comp_val_idx1,
     )
     packed_max11 = tl.max(comp_val_idx1)
-    _2, group_idx1 = _unpack_val_idx_fp32(packed_max11)
+    _2, group_idx1 = _unpack_val_idx_fp32(packed_max11, SUPPORT_UINT64)
     comp_val_idx1 = tl.where(
         comp_val_idx1 == packed_max11,
-        _pack_val_idx_fp32(min_val1, warps),
+        _pack_val_idx_fp32(min_val1, warps, SUPPORT_UINT64),
         comp_val_idx1,
     )
     packed_max12 = tl.max(comp_val_idx1)
-    _2, group_idx2 = _unpack_val_idx_fp32(packed_max12)
+    _2, group_idx2 = _unpack_val_idx_fp32(packed_max12, SUPPORT_UINT64)
     comp_val_idx1 = tl.where(
         comp_val_idx1 == packed_max12,
-        _pack_val_idx_fp32(min_val1, warps),
+        _pack_val_idx_fp32(min_val1, warps, SUPPORT_UINT64),
         comp_val_idx1,
     )
     packed_max13 = tl.max(comp_val_idx1)
-    _2, group_idx3 = _unpack_val_idx_fp32(packed_max13)
+    _2, group_idx3 = _unpack_val_idx_fp32(packed_max13, SUPPORT_UINT64)
 
     # step4: get topk, topk <= MAX_NUM_TOP_EXPERTS, where MAX_NUM_TOP_EXPERTS = 8
     expert_idx_group0 = group_idx0 * num_experts_per_group + lane
@@ -434,10 +458,10 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         mask=(3 < topk_group) & (lane < num_experts_per_group),
         other=neg_inf,
     )
-    comp_val_idx20 = _pack_val_idx_fp32(expert_score_group0, expert_idx_group0)
-    comp_val_idx21 = _pack_val_idx_fp32(expert_score_group1, expert_idx_group1)
-    comp_val_idx22 = _pack_val_idx_fp32(expert_score_group2, expert_idx_group2)
-    comp_val_idx23 = _pack_val_idx_fp32(expert_score_group3, expert_idx_group3)
+    comp_val_idx20 = _pack_val_idx_fp32(expert_score_group0, expert_idx_group0, SUPPORT_UINT64)
+    comp_val_idx21 = _pack_val_idx_fp32(expert_score_group1, expert_idx_group1, SUPPORT_UINT64)
+    comp_val_idx22 = _pack_val_idx_fp32(expert_score_group2, expert_idx_group2, SUPPORT_UINT64)
+    comp_val_idx23 = _pack_val_idx_fp32(expert_score_group3, expert_idx_group3, SUPPORT_UINT64)
     # TOPK_SWAP(0, 2); TOPK_SWAP(1, 3); TOPK_SWAP(0, 1); TOPK_SWAP(2, 3); TOPK_SWAP(1, 2);
     comp_val_idx20, comp_val_idx22 = max(comp_val_idx20, comp_val_idx22), min(
         comp_val_idx20, comp_val_idx22
@@ -457,7 +481,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
 
     min_val2 = tl.full((WARP_SIZE,), neg_inf, dtype=tl.float32)
     top_experts = tl.full((WARP_SIZE,), MAX_IDX, dtype=tl.uint32)
-    packed_max20 = tl.full((), 0, dtype=tl.uint64)
+    packed_max20 = tl.full((), 0, dtype=tl.uint64 if SUPPORT_UINT64 else tl.int64)
     for kk in tl.static_range(0, topk):
         update = (kk > 0) & (comp_val_idx20 == packed_max20)
         comp_val_idx20 = tl.where(
@@ -477,11 +501,11 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         )
         comp_val_idx23 = tl.where(
             update,
-            _pack_val_idx_fp32(min_val2, expert_idx_group3),
+            _pack_val_idx_fp32(min_val2, expert_idx_group3, SUPPORT_UINT64),
             comp_val_idx23,
         )
         packed_max20 = tl.max(comp_val_idx20)
-        _3, out_idx = _unpack_val_idx_fp32(packed_max20)
+        _3, out_idx = _unpack_val_idx_fp32(packed_max20, SUPPORT_UINT64)
         top_experts = tl.where(lane == kk, out_idx, top_experts)
 
     # step5: renormalize and output
@@ -592,6 +616,7 @@ def grouped_topk(
             g_scores_bias,
             SCORING_FUNC=scoring_func,
             HAS_TLE=HAS_TLE,
+            SUPPORT_UINT64=SUPPORT_UINT64,
             num_warps=1,
         )
 
