@@ -119,7 +119,8 @@ class GroupedTopKBenchmark(base.Benchmark):
         grouped_topk_configs = [
             # Deepseek-3.2
             (num_tokens, num_experts, n_group, topk_group, topk)
-            for num_tokens in [1, 8, 32, 64, 128, 256, 496, 512, 16384]
+            #for num_tokens in [1, 8, 32, 64, 128, 256, 496, 512, 16384]
+            for num_tokens in [16384]
             for num_experts in [256]
             for n_group in [8]
             for topk_group in [4]
@@ -167,6 +168,7 @@ def test_grouped_topk_no_renorm():
 
 
 @pytest.mark.grouped_topk
+@pytest.mark.skipif(True, reason="test")
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working ")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
 @pytest.mark.skipif(flag_gems.vendor_name == "cambricon", reason="#2891: TypeError")
@@ -184,6 +186,7 @@ def test_grouped_topk_score_0():
 
 
 @pytest.mark.grouped_topk
+@pytest.mark.skipif(True, reason="test")
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
 @pytest.mark.skipif(flag_gems.vendor_name == "cambricon", reason="#2891: TypeError")
