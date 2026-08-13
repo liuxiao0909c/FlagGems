@@ -22,6 +22,7 @@ from .fused_moe import (
     invoke_fused_moe_triton_kernel,
     outplace_fused_experts,
 )
+from .grouped_topk import grouped_topk
 from .moe_align_block_size import moe_align_block_size, moe_align_block_size_triton
 from .moe_sum import moe_sum
 from .rotary_embedding import apply_rotary_pos_emb
@@ -33,6 +34,7 @@ __all__ = [
     "apply_rotary_pos_emb",
     "flash_mla",
     "fused_add_rms_norm",
+    "grouped_topk",
     "skip_layer_norm",
     "sparse_attn_triton",
     "moe_align_block_size",
