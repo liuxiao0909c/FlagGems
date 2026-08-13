@@ -108,7 +108,6 @@ def torch_grouped_topk(
         top_group_pairs = torch.topk(group_pairs.cpu(), k=topk_group, dim=-1, sorted=use_sorted)[0].to(scores.device)
     else:
         top_group_pairs = torch.topk(group_pairs, k=topk_group, dim=-1, sorted=use_sorted)[0]
-    top_group_pairs = torch.topk(group_pairs, k=topk_group, dim=-1, sorted=use_sorted)[0]
     _top_group_scores, group_idx = _unpack_val_idx_fp32(top_group_pairs) # [n, top_k_group]
     group_mask = torch.zeros_like(group_scores)  # [n, n_group]
     group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
