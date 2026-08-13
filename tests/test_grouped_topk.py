@@ -26,6 +26,7 @@ from . import conftest as cfg
 random.seed(time.time() // 100)
 
 device = flag_gems.device
+vendor_name = flag_gems.vendor_name
 
 if cfg.QUICK_MODE:
     N_TOKEN_LIST = [8]
@@ -48,11 +49,31 @@ else:
     DTYPE_LIST = [torch.bfloat16, torch.float32]
 
 
-@torch.compile(
-    dynamic=True,
-    backend="inductor",
-    options={"graph_partition": False},
-)
+MAX_IDX = 0xFFFF
+SIGN_MASK_INT32 = torch.tensor(0x80000000, dtype=torch.uint32).view(torch.int32)
+SIGN_MASK_INT64 = torch.tensor(0x80000000, dtype=torch.int64)
+
+
+def _pack_val_idx_fp32(val: torch.Tensor, idx: torch.Tensor):
+    bits = val.view(torch.int32)
+    sign = bits & SIGN_MASK_INT32
+    key = torch.where(sign != 0, ~bits, bits).to(torch.int64)
+    key = torch.where(sign != 0, key, key | SIGN_MASK_INT64)
+    high = key << 16
+    low = (0xFFFF & (MAX_IDX - idx)).to(torch.int64)
+    return high | low
+
+
+def _unpack_val_idx_fp32(pair: torch.Tensor):
+    key = pair >> 16
+    sign = key & SIGN_MASK_INT64
+    bits = torch.where(sign != 0, key ^ SIGN_MASK_INT64, key).to(torch.int32)
+    bits = torch.where(sign != 0, bits, ~bits)
+    val = bits.view(torch.float32)
+    idx = (MAX_IDX - (pair & 0xFFFF)).to(torch.int32)
+    return val, idx
+
+
 def torch_grouped_topk(
     scores: torch.Tensor,
     num_expert_group: int,
@@ -88,14 +109,16 @@ def torch_grouped_topk(
     )  # [n, e]
     tmp_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
 
+    # torch.topk is not stable, pack with id before topk
+    tmp_ids = torch.arange(0, scores.size(1), dtype=torch.int32, device=scores.device)
+    tmp_ids = tmp_ids[None, :].expand(num_token, -1)
+    pairs = _pack_val_idx_fp32(tmp_scores, tmp_ids)
+    top_pairs = torch.topk(pairs, k=topk, dim=-1, sorted=use_sorted)[0]
     if bias is not None:
-        topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=use_sorted)[1]
-        # Use original unbiased scores for the routing weights
+        _, topk_ids = _unpack_val_idx_fp32(top_pairs)
         topk_weights = original_scores.gather(1, topk_ids)
     else:
-        topk_weights, topk_ids = torch.topk(
-            tmp_scores, k=topk, dim=-1, sorted=use_sorted
-        )
+        topk_weights, topk_ids = _unpack_val_idx_fp32(top_pairs)
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -105,20 +128,22 @@ def torch_grouped_topk(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
-vendor_name = flag_gems.vendor_name
+pytestmark = pytest.mark.skipif(
+    not (vendor_name in {"mthreads", "ascend"}) and not torch.cuda.is_available(),
+    reason="CUDA device required",
+)
 
 try:
     if vendor_name == "metax":
-        from vllm_metax._custom_ops import grouped_topk as vllm_grouped_topk
+        from vllm_metax._custom_ops import grouped_topk as ref_grouped_topk
     elif vendor_name == "mthreads" or vendor_name == "hygon" or vendor_name == "ascend":
-        vllm_grouped_topk = torch_grouped_topk
+        # vllm/_custom_ops.py:
+        #    The fused grouped_topk kernel is only available on CUDA platforms
+        ref_grouped_topk = torch_grouped_topk
     else:
-        from vllm._custom_ops import grouped_topk as vllm_grouped_topk
-
-    HAS_VLLM = True
+        from vllm._custom_ops import grouped_topk as ref_grouped_topk
 except (ImportError, AttributeError):
-    HAS_VLLM = False
-    vllm_grouped_topk = None
+    ref_grouped_topk = torch_grouped_topk
 
 
 def get_tolerance(dtype, scoring_func, renormalize):
@@ -137,7 +162,6 @@ def get_tolerance(dtype, scoring_func, renormalize):
 
 
 @pytest.mark.grouped_topk
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("n_token", N_TOKEN_LIST_DEEPSEEK_V3_2)
 @pytest.mark.parametrize("renormalize", RENORMALIZE_LIST)
 @pytest.mark.parametrize("scoring_func", SCORING_FUNC_LIST)
@@ -149,7 +173,6 @@ def test_grouped_topk_deepseek_v3_2(
     """Test grouped_topk accuracy with configs from DeepSeek-v3.2"""
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
-    ref_grouped_topk = vllm_grouped_topk if HAS_VLLM else torch_grouped_topk
 
     n_expert = 256
     n_group = 8
@@ -197,7 +220,6 @@ def test_grouped_topk_deepseek_v3_2(
 
 
 @pytest.mark.grouped_topk
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("n_token", N_TOKEN_LIST)
 @pytest.mark.parametrize("n_expert", N_EXPERT_LIST)
 @pytest.mark.parametrize("n_group", N_GROUP_LIST)
@@ -221,7 +243,6 @@ def test_grouped_topk(
 
     torch.manual_seed(45)
     torch.cuda.manual_seed(45)
-    ref_grouped_topk = vllm_grouped_topk if HAS_VLLM else torch_grouped_topk
 
     topk_group = topk
     routed_scaling_factor = 1.0
@@ -262,7 +283,6 @@ def test_grouped_topk(
 
 
 @pytest.mark.grouped_topk
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("n_token", [32, 64])
 @pytest.mark.parametrize("n_expert", [64])
 @pytest.mark.parametrize("n_group", [8])
@@ -284,7 +304,6 @@ def test_grouped_topk_large_scale(
     """Test grouped_topk with larger scale configurations"""
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
-    ref_grouped_topk = vllm_grouped_topk if HAS_VLLM else torch_grouped_topk
 
     routed_scaling_factor = 1.0
 
@@ -324,7 +343,6 @@ def test_grouped_topk_large_scale(
 
 
 @pytest.mark.grouped_topk
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("routed_scaling_factor", [1.0, 2.5])
 @pytest.mark.parametrize("renormalize", [True, False])
 def test_grouped_topk_scaling_factor(routed_scaling_factor, renormalize):
@@ -332,7 +350,6 @@ def test_grouped_topk_scaling_factor(routed_scaling_factor, renormalize):
 
     torch.manual_seed(45)
     torch.cuda.manual_seed(45)
-    ref_grouped_topk = vllm_grouped_topk if HAS_VLLM else torch_grouped_topk
 
     dtype = torch.float32
     scores = torch.randn((8, 16), dtype=dtype, device=flag_gems.device)
@@ -357,7 +374,6 @@ def test_grouped_topk_scaling_factor(routed_scaling_factor, renormalize):
 
 
 @pytest.mark.grouped_topk
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("renormalize", [True, False])
 @pytest.mark.parametrize("scoring_func", [0, 1])
 def test_grouped_topk_single_token(renormalize, scoring_func):
@@ -365,7 +381,6 @@ def test_grouped_topk_single_token(renormalize, scoring_func):
 
     torch.manual_seed(45)
     torch.cuda.manual_seed(45)
-    ref_grouped_topk = vllm_grouped_topk if HAS_VLLM else torch_grouped_topk
 
     dtype = torch.float32
     scores = torch.randn((1, 16), dtype=dtype, device=flag_gems.device)
@@ -390,13 +405,11 @@ def test_grouped_topk_single_token(renormalize, scoring_func):
 
 
 @pytest.mark.grouped_topk
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("renormalize", [True, False])
 def test_grouped_topk_sigmoid(renormalize):
     """Test grouped_topk with sigmoid scoring function"""
     torch.manual_seed(45)
     torch.cuda.manual_seed(45)
-    ref_grouped_topk = vllm_grouped_topk if HAS_VLLM else torch_grouped_topk
 
     dtype = torch.float32
     scores = torch.randn((8, 16), dtype=dtype, device=flag_gems.device)

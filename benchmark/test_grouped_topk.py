@@ -19,11 +19,32 @@ import flag_gems
 
 from . import base, utils
 
-@torch.compile(
-    dynamic=True,
-    backend="inductor",
-    options={"graph_partition": False},
-)
+
+MAX_IDX = 0xFFFF
+SIGN_MASK_INT32 = torch.tensor(0x80000000, dtype=torch.uint32).view(torch.int32)
+SIGN_MASK_INT64 = torch.tensor(0x80000000, dtype=torch.int64)
+
+
+def _pack_val_idx_fp32(val: torch.Tensor, idx: torch.Tensor):
+    bits = val.view(torch.int32)
+    sign = bits & SIGN_MASK_INT32
+    key = torch.where(sign != 0, ~bits, bits).to(torch.int64)
+    key = torch.where(sign != 0, key, key | SIGN_MASK_INT64)
+    high = key << 16
+    low = (0xFFFF & (MAX_IDX - idx)).to(torch.int64)
+    return high | low
+
+
+def _unpack_val_idx_fp32(pair: torch.Tensor):
+    key = pair >> 16
+    sign = key & SIGN_MASK_INT64
+    bits = torch.where(sign != 0, key ^ SIGN_MASK_INT64, key).to(torch.int32)
+    bits = torch.where(sign != 0, bits, ~bits)
+    val = bits.view(torch.float32)
+    idx = (MAX_IDX - (pair & 0xFFFF)).to(torch.int32)
+    return val, idx
+
+
 def torch_grouped_topk(
     scores: torch.Tensor,
     num_expert_group: int,
@@ -59,14 +80,16 @@ def torch_grouped_topk(
     )  # [n, e]
     tmp_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
 
+    # torch.topk is not stable, pack with id before topk
+    tmp_ids = torch.arange(0, scores.size(1), dtype=torch.int32, device=scores.device)
+    tmp_ids = tmp_ids[None, :].expand(num_token, -1)
+    pairs = _pack_val_idx_fp32(tmp_scores, tmp_ids)
+    top_pairs = torch.topk(pairs, k=topk, dim=-1, sorted=use_sorted)[0]
     if bias is not None:
-        topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=use_sorted)[1]
-        # Use original unbiased scores for the routing weights
+        _, topk_ids = _unpack_val_idx_fp32(top_pairs)
         topk_weights = original_scores.gather(1, topk_ids)
     else:
-        topk_weights, topk_ids = torch.topk(
-            tmp_scores, k=topk, dim=-1, sorted=use_sorted
-        )
+        topk_weights, topk_ids = _unpack_val_idx_fp32(top_pairs)
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -80,16 +103,25 @@ vendor_name = flag_gems.vendor_name
 
 try:
     if vendor_name == "metax":
-        from vllm_metax._custom_ops import grouped_topk as vllm_grouped_topk
+        from vllm_metax._custom_ops import grouped_topk as ref_grouped_topk
+        HAS_VLLM = True
     elif vendor_name == "mthreads" or vendor_name == "hygon" or vendor_name == "ascend":
-        vllm_grouped_topk = torch_grouped_topk
+        # vllm/_custom_ops.py:
+        #    The fused grouped_topk kernel is only available on CUDA platforms
+        ref_grouped_topk = torch_grouped_topk
+        HAS_VLLM = False
     else:
-        from vllm._custom_ops import grouped_topk as vllm_grouped_topk
-
-    HAS_VLLM = True
+        from vllm._custom_ops import grouped_topk as ref_grouped_topk
+        HAS_VLLM = True
 except (ImportError, AttributeError):
+    ref_grouped_topk = torch_grouped_topk
     HAS_VLLM = False
-    vllm_grouped_topk = None
+
+
+pytestmark = pytest.mark.skipif(
+    HAS_VLLM and (utils.SkipVersion("vllm", "<0.9") or utils.SkipVersion("torch", "<2.7")),
+    reason="vLLM or PyTorch version is too low when taking vLLM as reference.",
+)
 
 
 class GroupedTopKBenchmark(base.Benchmark):
@@ -142,19 +174,8 @@ class GroupedTopKBenchmark(base.Benchmark):
 
 
 @pytest.mark.grouped_topk
-#@pytest.mark.skipif(not HAS_VLLM, reason="Skipped due to missing vLLM grouped_topk")
-#@pytest.mark.skipif(
-#    utils.SkipVersion("vllm", "<0.9"),
-#    reason="The version prior to 0.9 does not include the grouped_topk kernel.",
-#)
-#@pytest.mark.skipif(
-#    utils.SkipVersion("torch", "<2.7"),
-#    reason="The version prior to 2.7 is not compatible with VLLM.",
-#)
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
-#@pytest.mark.skipif(vendor_name == "mthreads", reason="#2891: Not working")
-#@pytest.mark.skipif(vendor_name == "hygon", reason="#2891: RuntimeError")
 @pytest.mark.skipif(flag_gems.vendor_name == "cambricon", reason="#2891: TypeError")
 def test_grouped_topk_no_renorm():
     bench = GroupedTopKBenchmark(
@@ -170,19 +191,8 @@ def test_grouped_topk_no_renorm():
 
 
 @pytest.mark.grouped_topk
-#@pytest.mark.skipif(not HAS_VLLM, reason="Skipped due to missing vLLM grouped_topk")
-#@pytest.mark.skipif(
-#    utils.SkipVersion("vllm", "<0.9"),
-#    reason="The version prior to 0.9 does not include the grouped_topk kernel.",
-#)
-#@pytest.mark.skipif(
-#    utils.SkipVersion("torch", "<2.7"),
-#    reason="The version prior to 2.7 is not compatible with VLLM.",
-#)
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working ")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
-#@pytest.mark.skipif(vendor_name == "mthreads", reason="#2891: Not working")
-#@pytest.mark.skipif(vendor_name == "hygon", reason="#2891: RuntimeError")
 @pytest.mark.skipif(flag_gems.vendor_name == "cambricon", reason="#2891: TypeError")
 def test_grouped_topk_score_0():
     bench = GroupedTopKBenchmark(
@@ -198,19 +208,8 @@ def test_grouped_topk_score_0():
 
 
 @pytest.mark.grouped_topk
-#@pytest.mark.skipif(not HAS_VLLM, reason="Skipped due to missing vLLM grouped_topk")
-#@pytest.mark.skipif(
-#    utils.SkipVersion("vllm", "<0.9"),
-#    reason="The version prior to 0.9 does not include the grouped_topk kernel.",
-#)
-#@pytest.mark.skipif(
-#    utils.SkipVersion("torch", "<2.7"),
-#    reason="The version prior to 2.7 is not compatible with VLLM.",
-#)
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="#2891: Not working")
 @pytest.mark.skipif(vendor_name == "iluvatar", reason="#2891: Not working")
-#@pytest.mark.skipif(vendor_name == "mthreads", reason="#2891: Not working")
-#@pytest.mark.skipif(vendor_name == "hygon", reason="#2891: RuntimeError")
 @pytest.mark.skipif(flag_gems.vendor_name == "cambricon", reason="#2891: TypeError")
 def test_grouped_topk_score_1():
     bench = GroupedTopKBenchmark(
