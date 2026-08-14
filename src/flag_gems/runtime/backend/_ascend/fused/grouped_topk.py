@@ -39,17 +39,30 @@ def _triton_version_at_least(major: int, minor: int, patch: int = 0) -> bool:
     return tuple(parsed) >= (major, minor, patch)
 
 
-if _triton_version_at_least(3, 5, 0):
+HAS_TLE_V3_5 = False
+HAS_TLE_V3_2 = False
+
+import pdb; pdb.set_trace()
+if _triton_version_at_least(3, 5, 0):  # ascend35
     try:
         import triton.experimental.tle.language as tle
 
-        HAS_TLE = True
+        HAS_TLE_V3_5 = True
     except ImportError:
         tle = None
-        HAS_TLE = False
+        HAS_TLE_V3_5 = False
+elif _triton_version_at_least(3, 2, 0):  # ascend32
+    try:
+        import triton.experimental.tle.language as tle
+
+        HAS_TLE_V3_2 = True
+    except ImportError:
+        tle = None
+        HAS_TLE_V3_2 = False
 else:
     tle = None
-    HAS_TLE = False
+    HAS_TLE_V3_5 = False
+    HAS_TLE_V3_2 = False
 
 
 SUPPORT_UINT64 = False if runtime_device.vendor_name == "ascend" else True
@@ -315,7 +328,8 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     g_score_sigmoid_ptr,
     g_score_bias_ptr,
     SCORING_FUNC: tl.constexpr,
-    HAS_TLE: tl.constexpr,
+    HAS_TLE_V3_2: tl.constexpr,
+    HAS_TLE_V3_5: tl.constexpr,
     SUPPORT_UINT64: tl.constexpr,
 ):
     WARP_SIZE: tl.constexpr = 32
@@ -330,7 +344,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     warps = tl.arange(0, NUM_WARPS)
     lane = tl.arange(0, WARP_SIZE)
 
-    if HAS_TLE:
+    if HAS_TLE_V3_5:
         s_score_sigmoid = tle.gpu.alloc(
             [NUM_WARPS, WARP_SIZE],
             dtype=tl.float32,
@@ -347,6 +361,8 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         )
         s_score_sigmoid_ptr = tle.gpu.local_ptr(s_score_sigmoid, (0, 0))
         s_score_bias_ptr = tle.gpu.local_ptr(s_score_bias, (0, 0))
+    elif HAS_TLE_V3_2:
+        pass
     else:
         s_score_sigmoid_ptr = g_score_sigmoid_ptr + token_id * scores_stride0
         s_score_bias_ptr = g_score_bias_ptr + token_id * scores_stride0
@@ -362,22 +378,28 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         score_sigmoid = _sigmoid(score)
     else:
         score_sigmoid = score
-    tl.store(
-        s_score_sigmoid_ptr + offs,
-        score_sigmoid,
-        mask=(warps[:, None] < num_groups) & (lane[None, :] < num_experts_per_group),
-    )
+    if HAS_TLE_V3_2:
+        pass
+    else:
+        tl.store(
+            s_score_sigmoid_ptr + offs,
+            score_sigmoid,
+            mask=(warps[:, None] < num_groups) & (lane[None, :] < num_experts_per_group),
+        )
     bias_val = tl.load(
         routing_bias_ptr + offs,
         mask=(warps[:, None] < num_groups) & (lane[None, :] < num_experts_per_group),
         other=neg_inf,
     ).to(tl.float32)
     score_bias = score_sigmoid + bias_val
-    tl.store(
-        s_score_bias_ptr + offs,
-        score_bias,
-        mask=(warps[:, None] < num_groups) & (lane[None, :] < num_experts_per_group),
-    )
+    if HAS_TLE_V3_2:
+        s_score_bias = tle.dsa.to_buffer(score_bias, tle.dsa.ascend.UB)
+    else:
+        tl.store(
+            s_score_bias_ptr + offs,
+            score_bias,
+            mask=(warps[:, None] < num_groups) & (lane[None, :] < num_experts_per_group),
+        )
 
     # step2: get top2 as group_score
     group_max_val0, group_max_index0 = tl.max(score_bias, axis=-1, return_indices=True, return_indices_tie_break_left=True)
@@ -399,26 +421,32 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     expert_idx_group1 = group_idx1 * num_experts_per_group + lane
     expert_idx_group2 = group_idx2 * num_experts_per_group + lane
     expert_idx_group3 = group_idx3 * num_experts_per_group + lane
-    expert_score_group0 = tl.load(
-        s_score_bias_ptr + expert_idx_group0,
-        mask=(0 < topk_group) & (lane < num_experts_per_group),
-        other=neg_inf,
-    )
-    expert_score_group1 = tl.load(
-        s_score_bias_ptr + expert_idx_group1,
-        mask=(1 < topk_group) & (lane < num_experts_per_group),
-        other=neg_inf,
-    )
-    expert_score_group2 = tl.load(
-        s_score_bias_ptr + expert_idx_group2,
-        mask=(2 < topk_group) & (lane < num_experts_per_group),
-        other=neg_inf,
-    )
-    expert_score_group3 = tl.load(
-        s_score_bias_ptr + expert_idx_group3,
-        mask=(3 < topk_group) & (lane < num_experts_per_group),
-        other=neg_inf,
-    )
+    if HAS_TLE_V3_2:
+        expert_score_group0 = tle.dsa.extract_slice(s_score_bias, offsets=(group_idx0, 0), sizes=(1, WARP_SIZE), strides=(1, 1))
+        expert_score_group1 = tle.dsa.extract_slice(s_score_bias, offsets=(group_idx1, 0), sizes=(1, WARP_SIZE), strides=(1, 1))
+        expert_score_group2 = tle.dsa.extract_slice(s_score_bias, offsets=(group_idx2, 0), sizes=(1, WARP_SIZE), strides=(1, 1))
+        expert_score_group3 = tle.dsa.extract_slice(s_score_bias, offsets=(group_idx3, 0), sizes=(1, WARP_SIZE), strides=(1, 1))
+    else:
+        expert_score_group0 = tl.load(
+            s_score_bias_ptr + expert_idx_group0,
+            mask=(0 < topk_group) & (lane < num_experts_per_group),
+            other=neg_inf,
+        )
+        expert_score_group1 = tl.load(
+            s_score_bias_ptr + expert_idx_group1,
+            mask=(1 < topk_group) & (lane < num_experts_per_group),
+            other=neg_inf,
+        )
+        expert_score_group2 = tl.load(
+            s_score_bias_ptr + expert_idx_group2,
+            mask=(2 < topk_group) & (lane < num_experts_per_group),
+            other=neg_inf,
+        )
+        expert_score_group3 = tl.load(
+            s_score_bias_ptr + expert_idx_group3,
+            mask=(3 < topk_group) & (lane < num_experts_per_group),
+            other=neg_inf,
+        )
     # TOPK_SWAP(0, 2); TOPK_SWAP(1, 3); TOPK_SWAP(0, 1); TOPK_SWAP(2, 3); TOPK_SWAP(1, 2);
     expert_score_group0, expert_idx_group0, expert_score_group2, expert_idx_group2 = _topk_swap(
         expert_score_group0, expert_idx_group0, expert_score_group2, expert_idx_group2
@@ -435,7 +463,10 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     expert_score_group1, expert_idx_group1, expert_score_group2, expert_idx_group2 = _topk_swap(
         expert_score_group1, expert_idx_group1, expert_score_group2, expert_idx_group2
     )
-    top_experts = tl.full((WARP_SIZE,), MAX_IDX, dtype=tl.int32)
+    if HAS_TLE_V3_2:
+        top_experts = tl.full((WARP_SIZE,), 0, dtype=tl.int32)
+    else:
+        top_experts = tl.full((WARP_SIZE,), MAX_IDX, dtype=tl.int32)
     lane_idx = tl.full((), MAX_IDX, dtype=tl.int32)
     for kk in tl.static_range(0, topk):
         update = (kk > 0) & (lane == lane_idx)
@@ -452,9 +483,16 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         top_experts = tl.where(lane == kk, out_idx, top_experts)
 
     # step5: renormalize and output
-    lane_unbiased = tl.load(
-        s_score_sigmoid_ptr + top_experts, mask=lane < topk, other=0.0
-    )
+    if HAS_TLE_V3_2:
+        loc0 = top_experts // num_experts_per_group
+        loc1 = top_experts % num_experts_per_group
+        pos = loc0 * WARP_SIZE + loc1
+        lane_unbiased = tl.gather(tl.reshape(score_sigmoid, (NUM_WARPS * WARP_SIZE)), pos, 0)
+        lane_unbiased = tl.where(lane < topk, lane_unbiased, 0.0)
+    else:
+        lane_unbiased = tl.load(
+            s_score_sigmoid_ptr + top_experts, mask=lane < topk, other=0.0
+        )
     topk_sum = 1e-20
     if renormalize:
         topk_sum += tl.sum(lane_unbiased)
@@ -526,7 +564,7 @@ def grouped_topk(
             device=scores.device,
             dtype=torch.int32,
         )
-        if not HAS_TLE:
+        if not HAS_TLE_V3_5 and not HAS_TLE_V3_2:
             g_scores_sigmoid = torch.empty(
                 (num_tokens, num_experts),
                 device=scores.device,
@@ -558,7 +596,8 @@ def grouped_topk(
             g_scores_sigmoid,
             g_scores_bias,
             SCORING_FUNC=scoring_func,
-            HAS_TLE=HAS_TLE,
+            HAS_TLE_V3_5=HAS_TLE_V3_5,
+            HAS_TLE_V3_2=HAS_TLE_V3_2,
             SUPPORT_UINT64=SUPPORT_UINT64,
             num_warps=1,
         )
