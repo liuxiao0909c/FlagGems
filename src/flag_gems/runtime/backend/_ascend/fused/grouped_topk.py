@@ -22,7 +22,24 @@ from flag_gems.utils import tl_extra_shim
 from flag_gems.utils.triton_version_utils import has_triton_tle
 from flag_gems.runtime import device as runtime_device
 
-if has_triton_tle(3, 6, 0):
+def _triton_version_at_least(major: int, minor: int, patch: int = 0) -> bool:
+    version = str(getattr(triton, "__version__", "0.0.0")).split("+", 1)[0]
+    parts = version.split(".")
+    parsed = []
+    for part in parts[:3]:
+        digits = []
+        for ch in part:
+            if ch.isdigit():
+                digits.append(ch)
+            else:
+                break
+        parsed.append(int("".join(digits)) if digits else 0)
+    while len(parsed) < 3:
+        parsed.append(0)
+    return tuple(parsed) >= (major, minor, patch)
+
+
+if _triton_version_at_least(3, 5, 0):
     try:
         import triton.experimental.tle.language as tle
 
