@@ -50,11 +50,11 @@ else:
 
 
 MAX_IDX = 0xFFFF
-SIGN_MASK_INT32 = torch.tensor(0x80000000, dtype=torch.uint32).view(torch.int32)
-SIGN_MASK_INT64 = torch.tensor(0x80000000, dtype=torch.int64)
 
 
 def _pack_val_idx_fp32(val: torch.Tensor, idx: torch.Tensor):
+    SIGN_MASK_INT32 = torch.tensor(0x80000000, dtype=torch.uint32, device=val.device).view(torch.int32)
+    SIGN_MASK_INT64 = torch.tensor(0x80000000, dtype=torch.int64, device=val.device)
     bits = val.view(torch.int32)
     sign = bits & SIGN_MASK_INT32
     key = torch.where(sign != 0, ~bits, bits).to(torch.int64)
@@ -65,6 +65,7 @@ def _pack_val_idx_fp32(val: torch.Tensor, idx: torch.Tensor):
 
 
 def _unpack_val_idx_fp32(pair: torch.Tensor):
+    SIGN_MASK_INT64 = torch.tensor(0x80000000, dtype=torch.int64, device=pair.device)
     key = pair >> 16
     sign = key & SIGN_MASK_INT64
     bits = torch.where(sign != 0, key ^ SIGN_MASK_INT64, key).to(torch.int32)
@@ -223,7 +224,12 @@ def test_grouped_topk_deepseek_v3_2(
             bias,
             scoring_func,
         )
+    if vendor_name == "ascend":
+        torch.npu.synchronize()
+    else:
+        torch.cuda.synchronize()
 
+    import pdb; pdb.set_trace()
     utils.gems_assert_equal(res_topk_ids, ref_topk_ids)
 
     atol, rtol = get_tolerance(ref_topk_weights.dtype, scoring_func, renormalize)
