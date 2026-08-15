@@ -42,7 +42,6 @@ def _triton_version_at_least(major: int, minor: int, patch: int = 0) -> bool:
 HAS_TLE_V3_5 = False
 HAS_TLE_V3_2 = False
 
-#import pdb; pdb.set_trace()
 if _triton_version_at_least(3, 2, 0):  # ascend32
     try:
         import triton.experimental.tle.language as tle
@@ -291,11 +290,11 @@ def _sigmoid(x):
 # return max(x, y), min(x, y)
 @triton.jit
 def _topk_swap(x_val, x_idx, y_val, y_idx):
-    mask = (x_val < y_val) | ((x_val == y_val) & (x_idx < y_idx))
-    min_val = tl.where(mask, x_val, y_val)
-    min_idx = tl.where(mask, x_idx, y_idx)
-    max_val = tl.where(not mask, x_val, y_val)
-    max_idx = tl.where(not mask, x_idx, y_idx)
+    mask = (x_val > y_val) | ((x_val == y_val) & (x_idx < y_idx))
+    max_val = tl.where(mask, x_val, y_val)
+    max_idx = tl.where(mask, x_idx, y_idx)
+    min_val = tl.where(not mask, x_val, y_val)
+    min_idx = tl.where(not mask, x_idx, y_idx)
     return max_val, max_idx, min_val, min_idx
 
 
@@ -356,10 +355,10 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
 
     # step2: get top2 as group_score
     group_max_val0, group_max_index0 = tl.max(score_bias, axis=-1, return_indices=True, return_indices_tie_break_left=True)
-    score_bias = tl.where(group_max_index0[:, None] == lane[None, :], neg_inf, score_bias)
-    group_max_val1 = tl.max(score_bias, axis=-1, return_indices_tie_break_left=True)
+    tmp_score_bias = tl.where(group_max_index0[:, None] == lane[None, :], neg_inf, score_bias)
+    group_max_val1 = tl.max(tmp_score_bias, axis=-1, return_indices_tie_break_left=True)
     group_score = group_max_val0 + group_max_val1  # [NUM_WARPS]
-
+ 
     # step3: get topk_group, topk_group <= MAX_NUM_TOP_GROUPS, where MAX_NUM_TOP_GROUPS = 4
     _1, group_idx0 = tl.max(group_score, axis=-1, return_indices=True, return_indices_tie_break_left=True)
     group_score = tl.where(group_idx0 == warps, neg_inf, group_score)
@@ -506,7 +505,6 @@ def grouped_topk(
             g_scores_sigmoid = None
             g_scores_bias = None
 
-        import pdb; pdb.set_trace()
         triton_grouped_topk_fused_small_expert_count_kernel[(num_tokens,)](
             scores,
             topk_values,
@@ -529,7 +527,6 @@ def grouped_topk(
             SUPPORT_UINT64=SUPPORT_UINT64,
             num_warps=1,
         )
-
         return topk_values, topk_indices
 
     if scoring_func == 1:
