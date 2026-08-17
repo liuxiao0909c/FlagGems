@@ -224,12 +224,7 @@ def test_grouped_topk_deepseek_v3_2(
             bias,
             scoring_func,
         )
-    if vendor_name == "ascend":
-        torch.npu.synchronize()
-    else:
-        torch.cuda.synchronize()
 
-    import pdb; pdb.set_trace()
     utils.gems_assert_equal(res_topk_ids, ref_topk_ids)
 
     atol, rtol = get_tolerance(ref_topk_weights.dtype, scoring_func, renormalize)
