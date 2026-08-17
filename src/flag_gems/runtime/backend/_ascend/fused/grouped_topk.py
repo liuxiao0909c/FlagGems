@@ -318,6 +318,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     scores_stride0,
     g_score_sigmoid_ptr,
     g_score_bias_ptr,
+    #dump_ptr,
     SCORING_FUNC: tl.constexpr,
     HAS_TLE_V3_2: tl.constexpr,
     HAS_TLE_V3_5: tl.constexpr,
@@ -330,6 +331,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
 
     token_id = tl.program_id(0)
     scores_ptr += token_id * scores_stride0
+    #dump_ptr += token_id * scores_stride0
     topk_values_ptr += token_id * topk
     topk_indices_ptr += token_id * topk
     warps = tl.arange(0, NUM_WARPS)
@@ -367,8 +369,13 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     _1, group_idx2 = tl.max(group_score, axis=-1, return_indices=True, return_indices_tie_break_left=True)
     group_score = tl.where(group_idx2 == warps, neg_inf, group_score)
     _1, group_idx3 = tl.max(group_score, axis=-1, return_indices=True, return_indices_tie_break_left=True)
+    #tl.store(dump_ptr + 0, group_idx0.to(tl.float32))
+    #tl.store(dump_ptr + 1, group_idx1.to(tl.float32))
+    #tl.store(dump_ptr + 2, group_idx2.to(tl.float32))
+    #tl.store(dump_ptr + 3, group_idx3.to(tl.float32))
 
     # step4: get topk, topk <= MAX_NUM_TOP_EXPERTS, where MAX_NUM_TOP_EXPERTS = 8
+    expert_score_invalid = tl.full([WARP_SIZE], neg_inf, dtype=tl.float32)
     expert_idx_group0 = group_idx0 * num_experts_per_group + lane
     expert_idx_group1 = group_idx1 * num_experts_per_group + lane
     expert_idx_group2 = group_idx2 * num_experts_per_group + lane
@@ -377,10 +384,13 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     expert_score_group0 = tl.reshape(expert_score_group0, WARP_SIZE)
     expert_score_group1 = tle.dsa.extract_slice(score_bias, offsets=(group_idx1, 0), sizes=(1, WARP_SIZE), strides=(1, 1))
     expert_score_group1 = tl.reshape(expert_score_group1, WARP_SIZE)
+    expert_score_group1 = tl.where(topk_group > 1, expert_score_group1, expert_score_invalid)
     expert_score_group2 = tle.dsa.extract_slice(score_bias, offsets=(group_idx2, 0), sizes=(1, WARP_SIZE), strides=(1, 1))
     expert_score_group2 = tl.reshape(expert_score_group2, WARP_SIZE)
+    expert_score_group2 = tl.where(topk_group > 2, expert_score_group2, expert_score_invalid)
     expert_score_group3 = tle.dsa.extract_slice(score_bias, offsets=(group_idx3, 0), sizes=(1, WARP_SIZE), strides=(1, 1))
     expert_score_group3 = tl.reshape(expert_score_group3, WARP_SIZE)
+    expert_score_group3 = tl.where(topk_group > 3, expert_score_group3, expert_score_invalid)
     # TOPK_SWAP(0, 2); TOPK_SWAP(1, 3); TOPK_SWAP(0, 1); TOPK_SWAP(2, 3); TOPK_SWAP(1, 2);
     expert_score_group0, expert_idx_group0, expert_score_group2, expert_idx_group2 = _topk_swap(
         expert_score_group0, expert_idx_group0, expert_score_group2, expert_idx_group2
@@ -397,7 +407,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     expert_score_group1, expert_idx_group1, expert_score_group2, expert_idx_group2 = _topk_swap(
         expert_score_group1, expert_idx_group1, expert_score_group2, expert_idx_group2
     )
-    top_experts = tl.full((WARP_SIZE,), 0, dtype=tl.int32)
+    top_experts = tl.full([WARP_SIZE], 0, dtype=tl.int32)
     lane_idx = tl.full((), MAX_IDX, dtype=tl.int32)
     for kk in tl.static_range(0, topk):
         update = (kk > 0) & (lane == lane_idx)
@@ -505,6 +515,7 @@ def grouped_topk(
             g_scores_sigmoid = None
             g_scores_bias = None
 
+        #dump_buf = torch.empty((num_tokens, num_experts), device=scores.device, dtype=torch.float32)
         triton_grouped_topk_fused_small_expert_count_kernel[(num_tokens,)](
             scores,
             topk_values,
@@ -521,12 +532,14 @@ def grouped_topk(
             scores.stride(0),
             g_scores_sigmoid,
             g_scores_bias,
+            #dump_buf,
             SCORING_FUNC=scoring_func,
             HAS_TLE_V3_5=HAS_TLE_V3_5,
             HAS_TLE_V3_2=HAS_TLE_V3_2,
             SUPPORT_UINT64=SUPPORT_UINT64,
             num_warps=1,
         )
+        #import pdb; pdb.set_trace()
         return topk_values, topk_indices
 
     if scoring_func == 1:
