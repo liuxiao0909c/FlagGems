@@ -336,8 +336,29 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     topk_indices_ptr += token_id * topk
     warps = tl.arange(0, NUM_WARPS)
     lane = tl.arange(0, WARP_SIZE)
+    lane2 = tl.where(lane < num_experts_per_group, lane, 0)
 
     # step1: load score/bias, get score_sigmoid/score_bias
+    #offs = warps[:, None] * num_experts_per_group + lane2[None, :]
+    #offs = warps[:, None] * num_experts_per_group + lane[None, :]
+    #offs = warps[:, None] * WARP_SIZE + lane[None, :]
+    #score_ub = tle.dsa.alloc([NUM_WARPS, WARP_SIZE], dtype=tl.bfloat16, mem_addr_space=tle.dsa.ascend.UB)
+    #bias_ub = tle.dsa.alloc([NUM_WARPS, WARP_SIZE], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB)
+    #tle.dsa.copy(scores_ptr + offs, score_ub, [NUM_WARPS, WARP_SIZE])
+    #tle.dsa.copy(routing_bias_ptr + offs, bias_ub, [NUM_WARPS, WARP_SIZE])
+    #score = tle.dsa.to_tensor(score_ub).to(tl.float32)
+    #if SCORING_FUNC == 1:
+    #    score_sigmoid = _sigmoid(score)
+    #else:
+    #    score_sigmoid = score
+    #bias_val = tle.dsa.to_tensor(score_ub)
+    #score_bias = score_sigmoid + bias_val
+    #score_bias = tl.where(lane2[None, :] < num_experts_per_group, score_bias, neg_inf)
+    #tl.store(topk_values_ptr + offs, score_bias, mask=offs == 0)
+    #return # 0.602975 if stride=WARP_SIZE, total 7.197604ms 
+    #       # 2.445227ms if stride=num_experts_per_group
+    #       # encountered AddPtrOp produced by unsupported operation if stride=num_experts_per_group and use lane2
+
     offs = warps[:, None] * num_experts_per_group + lane[None, :]
     score = tl.load(
         scores_ptr + offs,
@@ -354,9 +375,11 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         other=neg_inf,
     ).to(tl.float32)
     score_bias = score_sigmoid + bias_val
-    #return #0.001120
     #tl.store(topk_values_ptr + offs, score_bias, mask=offs == 0)
-    #return  # 2.651366ms
+    #return  # 2.471685ms if load with mask and stride=WARP_SIZE,
+    #        # 0.695006ms if load with non-mask and stride=WARP_SIZE
+    #        # 2.053127ms if load with non-mask and stride=num_experts_per_group,
+    #        # 2.489641ms if load with mask and stride=num_experts_per_group, 7.421885ms total
 
     # step2: get top2 as group_score
     group_max_val0, group_max_index0 = tl.max(score_bias, axis=-1, return_indices=True, return_indices_tie_break_left=True)
@@ -414,7 +437,10 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     expert_score_group1, expert_idx_group1, expert_score_group2, expert_idx_group2 = _topk_swap(
         expert_score_group1, expert_idx_group1, expert_score_group2, expert_idx_group2
     )
+    #tl.store(topk_values_ptr + lane, expert_score_group1, mask=lane < num_experts_per_group)
+    #return # 2.111557ms
     top_experts = tl.full([WARP_SIZE], 0, dtype=tl.int32)
+    top_experts2 = tl.full([WARP_SIZE], 0, dtype=tl.int32)
     lane_idx = tl.full((), MAX_IDX, dtype=tl.int32)
     for kk in tl.static_range(0, topk):
         update = (kk > 0) & (lane == lane_idx)
@@ -427,8 +453,30 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         expert_score_group3 = tl.where(update, neg_inf, expert_score_group3)
         expert_idx_group3 = tl.where(update, MAX_IDX, expert_idx_group3)
         _2, lane_idx = tl.max(expert_score_group0, axis=-1, return_indices=True, return_indices_tie_break_left=True)
+        #if kk == 7:
+        #     tl.store(topk_indices_ptr + kk, lane_idx)
+        #     return
+        #     # 2.487175ms if kk = 0
+        #     # 2.049560ms if kk = 1
+        #     # 3.422470ms if kk = 7 
         out_idx = tl.min(tl.where(lane == lane_idx, expert_idx_group0, MAX_IDX))
+        #if kk == 7:
+        #      top_experts2 = tl.where(lane == kk, out_idx, top_experts2)
+        #      tl.store(topk_indices_ptr + lane, top_experts2, mask=lane < topk)
+        #      return
+        #      # 4.813996ms if kk =7
+        #      tl.store(topk_indices_ptr + kk, out_idx)
+        #      return
+        #      # 4.427232ms if kk = 7
         top_experts = tl.where(lane == kk, out_idx, top_experts)
+        #if kk == 7:
+        #    tl.store(topk_indices_ptr + lane, top_experts, mask=lane < topk)
+        #    return
+        #    # 2.810297ms if kk = 0
+        #    # 5.659278ms if kk = 5
+        #    # 7.062613ms if kk = 7
+    #tl.store(topk_indices_ptr + lane, top_experts, mask=lane < topk)
+    #return # 7.063092ms
 
     # step5: renormalize and output
     group_id = top_experts // num_experts_per_group
