@@ -354,12 +354,17 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         other=neg_inf,
     ).to(tl.float32)
     score_bias = score_sigmoid + bias_val
+    #return #0.001120
+    #tl.store(topk_values_ptr + offs, score_bias, mask=offs == 0)
+    #return  # 2.651366ms
 
     # step2: get top2 as group_score
     group_max_val0, group_max_index0 = tl.max(score_bias, axis=-1, return_indices=True, return_indices_tie_break_left=True)
     tmp_score_bias = tl.where(group_max_index0[:, None] == lane[None, :], neg_inf, score_bias)
     group_max_val1 = tl.max(tmp_score_bias, axis=-1, return_indices_tie_break_left=True)
     group_score = group_max_val0 + group_max_val1  # [NUM_WARPS]
+    #tl.store(topk_values_ptr + warps, group_score, mask=warps == 0)
+    #return # 2.631876ms
  
     # step3: get topk_group, topk_group <= MAX_NUM_TOP_GROUPS, where MAX_NUM_TOP_GROUPS = 4
     _1, group_idx0 = tl.max(group_score, axis=-1, return_indices=True, return_indices_tie_break_left=True)
@@ -369,6 +374,8 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     _1, group_idx2 = tl.max(group_score, axis=-1, return_indices=True, return_indices_tie_break_left=True)
     group_score = tl.where(group_idx2 == warps, neg_inf, group_score)
     _1, group_idx3 = tl.max(group_score, axis=-1, return_indices=True, return_indices_tie_break_left=True)
+    #tl.store(topk_indices_ptr, group_idx3)
+    #return  # 2.414266ms
     #tl.store(dump_ptr + 0, group_idx0.to(tl.float32))
     #tl.store(dump_ptr + 1, group_idx1.to(tl.float32))
     #tl.store(dump_ptr + 2, group_idx2.to(tl.float32))
