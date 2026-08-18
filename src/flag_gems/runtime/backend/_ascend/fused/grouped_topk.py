@@ -351,7 +351,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         score_sigmoid = _sigmoid(score)
     else:
         score_sigmoid = score
-    bias_val = tle.dsa.to_tensor(score_ub)
+    bias_val = tle.dsa.to_tensor(bias_ub)
     score_bias = score_sigmoid + bias_val
     #score_bias = tl.where(lane2[None, :] < num_experts_per_group, score_bias, neg_inf)
     #tl.store(topk_values_ptr + offs, score_bias, mask=offs == 0)
@@ -459,8 +459,8 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         #     # 2.487175ms if kk = 0
         #     # 2.049560ms if kk = 1
         #     # 3.422470ms if kk = 7 
-        out_idx = tl.min(tl.where(lane == lane_idx, expert_idx_group0, MAX_IDX))
-        #out_idx = tle.dsa.extract_element(expert_idx_group0, indice=(lane_idx,))
+        #out_idx = tl.min(tl.where(lane == lane_idx, expert_idx_group0, MAX_IDX))
+        out_idx = tle.dsa.extract_element(expert_idx_group0, indice=(lane_idx,))
         #if kk == 7:
         #      top_experts2 = tl.where(lane == kk, out_idx, top_experts2)
         #      tl.store(topk_indices_ptr + lane, top_experts2, mask=lane < topk)
