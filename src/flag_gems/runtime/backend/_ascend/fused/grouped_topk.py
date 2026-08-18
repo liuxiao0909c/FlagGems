@@ -341,40 +341,40 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     # step1: load score/bias, get score_sigmoid/score_bias
     #offs = warps[:, None] * num_experts_per_group + lane2[None, :]
     #offs = warps[:, None] * num_experts_per_group + lane[None, :]
-    #offs = warps[:, None] * WARP_SIZE + lane[None, :]
-    #score_ub = tle.dsa.alloc([NUM_WARPS, WARP_SIZE], dtype=tl.bfloat16, mem_addr_space=tle.dsa.ascend.UB)
-    #bias_ub = tle.dsa.alloc([NUM_WARPS, WARP_SIZE], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB)
-    #tle.dsa.copy(scores_ptr + offs, score_ub, [NUM_WARPS, WARP_SIZE])
-    #tle.dsa.copy(routing_bias_ptr + offs, bias_ub, [NUM_WARPS, WARP_SIZE])
-    #score = tle.dsa.to_tensor(score_ub).to(tl.float32)
-    #if SCORING_FUNC == 1:
-    #    score_sigmoid = _sigmoid(score)
-    #else:
-    #    score_sigmoid = score
-    #bias_val = tle.dsa.to_tensor(score_ub)
-    #score_bias = score_sigmoid + bias_val
+    offs = warps[:, None] * WARP_SIZE + lane[None, :]
+    score_ub = tle.dsa.alloc([NUM_WARPS, WARP_SIZE], dtype=tl.bfloat16, mem_addr_space=tle.dsa.ascend.UB)
+    bias_ub = tle.dsa.alloc([NUM_WARPS, WARP_SIZE], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB)
+    tle.dsa.copy(scores_ptr + offs, score_ub, [NUM_WARPS, WARP_SIZE])
+    tle.dsa.copy(routing_bias_ptr + offs, bias_ub, [NUM_WARPS, WARP_SIZE])
+    score = tle.dsa.to_tensor(score_ub).to(tl.float32)
+    if SCORING_FUNC == 1:
+        score_sigmoid = _sigmoid(score)
+    else:
+        score_sigmoid = score
+    bias_val = tle.dsa.to_tensor(score_ub)
+    score_bias = score_sigmoid + bias_val
     #score_bias = tl.where(lane2[None, :] < num_experts_per_group, score_bias, neg_inf)
     #tl.store(topk_values_ptr + offs, score_bias, mask=offs == 0)
     #return # 0.602975 if stride=WARP_SIZE, total 7.197604ms 
     #       # 2.445227ms if stride=num_experts_per_group
     #       # encountered AddPtrOp produced by unsupported operation if stride=num_experts_per_group and use lane2
 
-    offs = warps[:, None] * num_experts_per_group + lane[None, :]
-    score = tl.load(
-        scores_ptr + offs,
-        mask=(warps[:, None] < num_groups) & (lane[None, :] < num_experts_per_group),
-        other=neg_inf,
-    ).to(tl.float32)
-    if SCORING_FUNC == 1:
-        score_sigmoid = _sigmoid(score)
-    else:
-        score_sigmoid = score
-    bias_val = tl.load(
-        routing_bias_ptr + offs,
-        mask=(warps[:, None] < num_groups) & (lane[None, :] < num_experts_per_group),
-        other=neg_inf,
-    ).to(tl.float32)
-    score_bias = score_sigmoid + bias_val
+    #offs = warps[:, None] * num_experts_per_group + lane[None, :]
+    #score = tl.load(
+    #    scores_ptr + offs,
+    #    mask=(warps[:, None] < num_groups) & (lane[None, :] < num_experts_per_group),
+    #    other=neg_inf,
+    #).to(tl.float32)
+    #if SCORING_FUNC == 1:
+    #    score_sigmoid = _sigmoid(score)
+    #else:
+    #    score_sigmoid = score
+    #bias_val = tl.load(
+    #    routing_bias_ptr + offs,
+    #    mask=(warps[:, None] < num_groups) & (lane[None, :] < num_experts_per_group),
+    #    other=neg_inf,
+    #).to(tl.float32)
+    #score_bias = score_sigmoid + bias_val
     #tl.store(topk_values_ptr + offs, score_bias, mask=offs == 0)
     #return  # 2.471685ms if load with mask and stride=WARP_SIZE,
     #        # 0.695006ms if load with non-mask and stride=WARP_SIZE
@@ -460,6 +460,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         #     # 2.049560ms if kk = 1
         #     # 3.422470ms if kk = 7 
         out_idx = tl.min(tl.where(lane == lane_idx, expert_idx_group0, MAX_IDX))
+        #out_idx = tle.dsa.extract_element(expert_idx_group0, indice=(lane_idx,))
         #if kk == 7:
         #      top_experts2 = tl.where(lane == kk, out_idx, top_experts2)
         #      tl.store(topk_indices_ptr + lane, top_experts2, mask=lane < topk)
@@ -476,12 +477,14 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         #    # 5.659278ms if kk = 5
         #    # 7.062613ms if kk = 7
     #tl.store(topk_indices_ptr + lane, top_experts, mask=lane < topk)
+    #tl.store(topk_values_ptr + offs, score_sigmoid, mask=offs < topk)
     #return # 7.063092ms
 
     # step5: renormalize and output
     group_id = top_experts // num_experts_per_group
     lane_id = top_experts % num_experts_per_group
     pos = group_id * WARP_SIZE + lane_id
+    #pos = top_experts
     lane_unbiased = tl.gather(tl.reshape(score_sigmoid, (NUM_WARPS * WARP_SIZE)), pos, 0)
     lane_unbiased = tl.where(lane < topk, lane_unbiased, 0.0)
     topk_sum = 1e-20
