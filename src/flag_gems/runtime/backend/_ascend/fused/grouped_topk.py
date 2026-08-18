@@ -318,7 +318,8 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     scores_stride0,
     g_score_sigmoid_ptr,
     g_score_bias_ptr,
-    #dump_ptr,
+    dump_ptr,
+    dump_ptr2,
     SCORING_FUNC: tl.constexpr,
     HAS_TLE_V3_2: tl.constexpr,
     HAS_TLE_V3_5: tl.constexpr,
@@ -331,7 +332,8 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
 
     token_id = tl.program_id(0)
     scores_ptr += token_id * scores_stride0
-    #dump_ptr += token_id * scores_stride0
+    dump_ptr += token_id * scores_stride0
+    dump_ptr2 += token_id * scores_stride0
     topk_values_ptr += token_id * topk
     topk_indices_ptr += token_id * topk
     warps = tl.arange(0, NUM_WARPS)
@@ -440,18 +442,47 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     #tl.store(topk_values_ptr + lane, expert_score_group1, mask=lane < num_experts_per_group)
     #return # 2.111557ms
     top_experts = tl.full([WARP_SIZE], 0, dtype=tl.int32)
-    top_experts2 = tl.full([WARP_SIZE], 0, dtype=tl.int32)
     lane_idx = tl.full((), MAX_IDX, dtype=tl.int32)
     for kk in tl.static_range(0, topk):
-        update = (kk > 0) & (lane == lane_idx)
-        expert_score_group0 = tl.where(update, expert_score_group1, expert_score_group0)
-        expert_idx_group0 = tl.where(update, expert_idx_group1, expert_idx_group0)
-        expert_score_group1 = tl.where(update, expert_score_group2, expert_score_group1)
-        expert_idx_group1 = tl.where(update, expert_idx_group2, expert_idx_group1)
-        expert_score_group2 = tl.where(update, expert_score_group3, expert_score_group2)
-        expert_idx_group2 = tl.where(update, expert_idx_group3, expert_idx_group2)
-        expert_score_group3 = tl.where(update, neg_inf, expert_score_group3)
-        expert_idx_group3 = tl.where(update, MAX_IDX, expert_idx_group3)
+        #update = (kk > 0) & (lane == lane_idx)
+        #expert_score_group0 = tl.where(update, expert_score_group1, expert_score_group0)
+        #expert_idx_group0 = tl.where(update, expert_idx_group1, expert_idx_group0)
+        #expert_score_group1 = tl.where(update, expert_score_group2, expert_score_group1)
+        #expert_idx_group1 = tl.where(update, expert_idx_group2, expert_idx_group1)
+        #expert_score_group2 = tl.where(update, expert_score_group3, expert_score_group2)
+        #expert_idx_group2 = tl.where(update, expert_idx_group3, expert_idx_group2)
+        #expert_score_group3 = tl.where(update, neg_inf, expert_score_group3)
+        #expert_idx_group3 = tl.where(update, MAX_IDX, expert_idx_group3)
+        if kk > 0:
+            sub_score33 = tle.dsa.extract_slice(expert_score_group3, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+            sub_score22 = tle.dsa.extract_slice(expert_score_group2, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+            sub_score11 = tle.dsa.extract_slice(expert_score_group1, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+            sub_score3_elem = tle.dsa.extract_element(expert_score_group3, indice=(lane_idx,))
+            sub_score3 = tl.full([1], sub_score3_elem, dtype=tl.float32)
+            sub_score2_elem = tle.dsa.extract_element(expert_score_group2, indice=(lane_idx,))
+            sub_score2 = tl.full([1], sub_score2_elem, dtype=tl.float32)
+            sub_score1_elem = tle.dsa.extract_element(expert_score_group1, indice=(lane_idx,))
+            sub_score1 = tl.full([1], sub_score1_elem, dtype=tl.float32)
+            invalid_score = tl.full([1], neg_inf, dtype=tl.float32)
+            expert_score_group3 = tle.dsa.insert_slice(expert_score_group3, invalid_score, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+            expert_score_group2 = tle.dsa.insert_slice(expert_score_group2, sub_score3, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+            expert_score_group1 = tle.dsa.insert_slice(expert_score_group1, sub_score2, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+            expert_score_group0 = tle.dsa.insert_slice(expert_score_group0, sub_score1, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+            sub_idx33 = tle.dsa.extract_slice(expert_idx_group3, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+            sub_idx22 = tle.dsa.extract_slice(expert_idx_group2, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+            sub_idx11 = tle.dsa.extract_slice(expert_idx_group1, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+            sub_idx3_elem = tle.dsa.extract_element(expert_idx_group3, indice=(lane_idx,))
+            sub_idx3 = tl.full([1], sub_idx3_elem, dtype=tl.int32)
+            sub_idx2_elem = tle.dsa.extract_element(expert_idx_group2, indice=(lane_idx,))
+            sub_idx2 = tl.full([1], sub_idx2_elem, dtype=tl.int32)
+            sub_idx1_elem = tle.dsa.extract_element(expert_idx_group1, indice=(lane_idx,))
+            sub_idx1 = tl.full([1], sub_idx1_elem, dtype=tl.int32)
+            invalid_idx = tl.full([1], MAX_IDX, dtype=tl.int32)
+            expert_idx_group3 = tle.dsa.insert_slice(expert_idx_group3, invalid_idx, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+            expert_idx_group2 = tle.dsa.insert_slice(expert_idx_group2, sub_idx3, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+            expert_idx_group1 = tle.dsa.insert_slice(expert_idx_group1, sub_idx2, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+            expert_idx_group0 = tle.dsa.insert_slice(expert_idx_group0, sub_idx1, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+
         _2, lane_idx = tl.max(expert_score_group0, axis=-1, return_indices=True, return_indices_tie_break_left=True)
         #if kk == 7:
         #     tl.store(topk_indices_ptr + kk, lane_idx)
@@ -460,7 +491,13 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         #     # 2.049560ms if kk = 1
         #     # 3.422470ms if kk = 7 
         #out_idx = tl.min(tl.where(lane == lane_idx, expert_idx_group0, MAX_IDX))
+        tl.store(dump_ptr + 32*kk + lane, expert_idx_group0.to(tl.float32))
         out_idx = tle.dsa.extract_element(expert_idx_group0, indice=(lane_idx,))
+        out_idx2 = tle.dsa.extract_slice(expert_idx_group0, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+        tl.store(dump_ptr2 + kk, lane_idx)
+        tl.store(dump_ptr2 + 8 + kk, out_idx)
+        tl.store(dump_ptr2 + 16 + kk, tl.max(out_idx2))
+        #out_idx = tle.dsa.extract_slice(expert_idx_group0, offsets=(lane_idx,), sizes=(1,), strides=(1,))
         #if kk == 7:
         #      top_experts2 = tl.where(lane == kk, out_idx, top_experts2)
         #      tl.store(topk_indices_ptr + lane, top_experts2, mask=lane < topk)
@@ -469,7 +506,12 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         #      tl.store(topk_indices_ptr + kk, out_idx)
         #      return
         #      # 4.427232ms if kk = 7
-        top_experts = tl.where(lane == kk, out_idx, top_experts)
+        #top_experts = tl.where(lane == kk, out_idx, top_experts)
+        #sub = tle.dsa.extract_slice(top_experts, offsets=(kk,), sizes=(1,), strides=(1,))
+        #sub = out_idx
+        #top_experts = tle.dsa.insert_slice(top_experts, sub, offsets=(kk,), sizes=(1,), strides=(1,))
+        out_idx_tensor = tl.full([1], out_idx, dtype=tl.int32)
+        top_experts = tle.dsa.insert_slice(top_experts, out_idx_tensor, offsets=(kk,), sizes=(1,), strides=(1,))
         #if kk == 7:
         #    tl.store(topk_indices_ptr + lane, top_experts, mask=lane < topk)
         #    return
@@ -574,6 +616,8 @@ def grouped_topk(
             g_scores_bias = None
 
         #dump_buf = torch.empty((num_tokens, num_experts), device=scores.device, dtype=torch.float32)
+        dump_buf = torch.zeros((num_tokens, num_experts), device=scores.device, dtype=torch.float32)
+        dump_buf2 = torch.zeros((num_tokens, num_experts), device=scores.device, dtype=torch.float32)
         triton_grouped_topk_fused_small_expert_count_kernel[(num_tokens,)](
             scores,
             topk_values,
@@ -590,14 +634,15 @@ def grouped_topk(
             scores.stride(0),
             g_scores_sigmoid,
             g_scores_bias,
-            #dump_buf,
+            dump_buf,
+            dump_buf2,
             SCORING_FUNC=scoring_func,
             HAS_TLE_V3_5=HAS_TLE_V3_5,
             HAS_TLE_V3_2=HAS_TLE_V3_2,
             SUPPORT_UINT64=SUPPORT_UINT64,
             num_warps=1,
         )
-        #import pdb; pdb.set_trace()
+        import pdb; pdb.set_trace()
         return topk_values, topk_indices
 
     if scoring_func == 1:
