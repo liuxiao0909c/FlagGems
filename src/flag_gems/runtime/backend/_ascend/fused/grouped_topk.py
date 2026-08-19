@@ -364,6 +364,74 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     #group_score = tl.where(group_idx2 == warps, neg_inf, group_score)
     group_score = tle.dsa.insert_slice(group_score, invalid_group_score, offsets=(group_idx2,), sizes=(1,), strides=(1,))
     _1, group_idx3 = tl.max(group_score, axis=-1, return_indices=True, return_indices_tie_break_left=True)
+
+    
+    if True:
+        #group_idxs = tl.full([4], MAX_IDX, dtype=tl.int32)
+        #group_idxs = tle.dsa.insert_slice(group_idxs, tl.full([1], group_idx0, dtype=tl.int32), offsets=(0,), sizes=(1,), strides=(1,))
+        #group_idxs = tle.dsa.insert_slice(group_idxs, tl.full([1], group_idx1, dtype=tl.int32), offsets=(1,), sizes=(1,), strides=(1,))
+        #group_idxs = tle.dsa.insert_slice(group_idxs, tl.full([1], group_idx2, dtype=tl.int32), offsets=(2,), sizes=(1,), strides=(1,))
+        #group_idxs = tle.dsa.insert_slice(group_idxs, tl.full([1], group_idx3, dtype=tl.int32), offsets=(3,), sizes=(1,), strides=(1,))
+        new_score_bias = tl.full([4 * WARP_SIZE], neg_inf, dtype=tl.float32)
+        score_group0 = tle.dsa.extract_slice(score_bias, offsets=(group_idx0, 0), sizes=(1, WARP_SIZE), strides=(1, 1)).reshape(WARP_SIZE)
+        new_score_bias = tle.dsa.insert_slice(new_score_bias, score_group0, offsets=(0 * WARP_SIZE,), sizes=(WARP_SIZE,), strides=(1,))
+        if topk_group > 1:
+            score_group1 = tle.dsa.extract_slice(score_bias, offsets=(group_idx1, 0), sizes=(1, WARP_SIZE), strides=(1, 1)).reshape(WARP_SIZE)
+            new_score_bias = tle.dsa.insert_slice(new_score_bias, score_group1, offsets=(1 * WARP_SIZE,), sizes=(WARP_SIZE,), strides=(1,))
+        if topk_group > 2:
+            score_group2 = tle.dsa.extract_slice(score_bias, offsets=(group_idx2, 0), sizes=(1, WARP_SIZE), strides=(1, 1)).reshape(WARP_SIZE)
+            new_score_bias = tle.dsa.insert_slice(new_score_bias, score_group2, offsets=(2 * WARP_SIZE,), sizes=(WARP_SIZE,), strides=(1,))
+        if topk_group > 3:
+            score_group3 = tle.dsa.extract_slice(score_bias, offsets=(group_idx3, 0), sizes=(1, WARP_SIZE), strides=(1, 1)).reshape(WARP_SIZE)
+            new_score_bias = tle.dsa.insert_slice(new_score_bias, score_group3, offsets=(3 * WARP_SIZE,), sizes=(WARP_SIZE,), strides=(1,))
+        #tl.store(dump_ptr2, group_idx0)
+        #tl.store(dump_ptr2 + 1, group_idx1)
+        #tl.store(dump_ptr2 + 2, group_idx2)
+        #tl.store(dump_ptr2 + 3, group_idx3)
+        #tl.store(dump_ptr2 + tl.arange(0, 4), group_idxs)
+        #tl.store(dump_ptr + tl.arange(0, 4 * WARP_SIZE), new_score_bias)
+        top_experts_idx = tl.full([8], 0, dtype=tl.int32)
+        top_experts_pos = tl.full([8], 0, dtype=tl.int32)
+        topk_offs = tl.arange(0, 8)
+        for j in tl.static_range(topk):
+            _2, new_off = tl.max(new_score_bias, axis=-1, return_indices=True, return_indices_tie_break_left=True)
+            #tl.store(dump_ptr2 + 4 + j, new_off)
+            new_score_bias = tle.dsa.insert_slice(
+                new_score_bias,
+                tl.full([1], neg_inf, dtype=tl.float32),
+                offsets=(new_off,),
+                sizes=(1,),
+                strides=(1,))
+            new_group_idx = new_off // WARP_SIZE
+            lane_idx = new_off % WARP_SIZE
+            if new_group_idx == 0:
+                actual_group_idx = group_idx0
+            elif new_group_idx == 1:
+                actual_group_idx = group_idx1
+            elif new_group_idx == 2:
+                actual_group_idx = group_idx2
+            else:
+                actual_group_idx = group_idx3
+            #actual_group_idx = tle.dsa.extract_element(group_idxs, indice=(new_group_idx,))
+            #actual_group_idx = tl.min(tle.dsa.extract_slice(group_idxs, offsets=(new_group_idx,), sizes=(1,), strides=(1,)))
+            #tl.store(dump_ptr2 + 12 + j, new_group_idx)
+            #tl.store(dump_ptr2 + 20 + j, actual_group_idx)
+            expert_id = actual_group_idx * num_experts_per_group + lane_idx
+            new_pos = actual_group_idx * WARP_SIZE + lane_idx
+            top_experts_idx = tle.dsa.insert_slice(top_experts_idx, tl.full([1], expert_id, dtype=tl.int32), offsets=(j,), sizes=(1,), strides=(1,))
+            top_experts_pos = tle.dsa.insert_slice(top_experts_pos, tl.full([1], new_pos, dtype=tl.int32), offsets=(j,), sizes=(1,), strides=(1,))
+        
+        new_lane_unbiased = tl.gather(tl.reshape(score_sigmoid, (NUM_WARPS * WARP_SIZE)), top_experts_pos, 0)
+        new_lane_unbiased = tl.where(topk_offs < topk, new_lane_unbiased, 0.0)
+        new_topk_sum = 1e-20
+        if renormalize:
+            new_topk_sum += tl.sum(new_lane_unbiased)
+        new_scale = routed_scaling_factor.to(tl.float32)
+        if renormalize:
+            new_scale /= new_topk_sum
+        tl.store(topk_values_ptr + topk_offs, new_lane_unbiased * new_scale, mask=topk_offs < topk)
+        tl.store(topk_indices_ptr + topk_offs, top_experts_idx, mask=topk_offs < topk)
+        return
     #tl.store(topk_indices_ptr, group_idx3)
     #return  # 2.414266ms
     #tl.store(dump_ptr + 0, group_idx0.to(tl.float32))
@@ -418,7 +486,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         #expert_idx_group2 = tl.where(update, expert_idx_group3, expert_idx_group2)
         #expert_score_group3 = tl.where(update, neg_inf, expert_score_group3)
         #expert_idx_group3 = tl.where(update, MAX_IDX, expert_idx_group3)
-        if kk > 0:
+        if kk > 0 and False:
             sub_score33 = tle.dsa.extract_slice(expert_score_group3, offsets=(lane_idx,), sizes=(1,), strides=(1,))
             sub_score22 = tle.dsa.extract_slice(expert_score_group2, offsets=(lane_idx,), sizes=(1,), strides=(1,))
             sub_score11 = tle.dsa.extract_slice(expert_score_group1, offsets=(lane_idx,), sizes=(1,), strides=(1,))
@@ -447,6 +515,9 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
             expert_idx_group2 = tle.dsa.insert_slice(expert_idx_group2, sub_idx33, offsets=(lane_idx,), sizes=(1,), strides=(1,))
             expert_idx_group1 = tle.dsa.insert_slice(expert_idx_group1, sub_idx22, offsets=(lane_idx,), sizes=(1,), strides=(1,))
             expert_idx_group0 = tle.dsa.insert_slice(expert_idx_group0, sub_idx11, offsets=(lane_idx,), sizes=(1,), strides=(1,))
+        if kk > 0:
+            invalid_score = tl.full([1], neg_inf, dtype=tl.float32)
+            expert_score_group0 = tle.dsa.insert_slice(expert_score_group0, invalid_score, offsets=(lane_idx,), sizes=(1,), strides=(1,))
 
         _2, lane_idx = tl.max(expert_score_group0, axis=-1, return_indices=True, return_indices_tie_break_left=True)
         #if kk == 7:
@@ -572,7 +643,7 @@ def grouped_topk(
         n_group_pad = triton.next_power_of_2(n_group)
         #dump_buf = torch.empty((num_tokens, num_experts), device=scores.device, dtype=torch.float32)
         #dump_buf = torch.zeros((num_tokens, num_experts), device=scores.device, dtype=torch.float32)
-        #dump_buf2 = torch.zeros((num_tokens, num_experts), device=scores.device, dtype=torch.float32)
+        #dump_buf2 = torch.zeros((num_tokens, num_experts), device=scores.device, dtype=torch.int32)
         triton_grouped_topk_fused_small_expert_count_kernel[(num_tokens,)](
             scores,
             topk_values,
