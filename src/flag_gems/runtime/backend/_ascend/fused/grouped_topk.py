@@ -17,46 +17,11 @@ import logging
 import torch
 import triton
 import triton.language as tl
+import triton.experimental.tle.language as tle
 
 from flag_gems.utils import tl_extra_shim
-from flag_gems.utils.triton_version_utils import has_triton_tle
-from flag_gems.runtime import device as runtime_device
-
-def _triton_version_at_least(major: int, minor: int, patch: int = 0) -> bool:
-    version = str(getattr(triton, "__version__", "0.0.0")).split("+", 1)[0]
-    parts = version.split(".")
-    parsed = []
-    for part in parts[:3]:
-        digits = []
-        for ch in part:
-            if ch.isdigit():
-                digits.append(ch)
-            else:
-                break
-        parsed.append(int("".join(digits)) if digits else 0)
-    while len(parsed) < 3:
-        parsed.append(0)
-    return tuple(parsed) >= (major, minor, patch)
 
 
-HAS_TLE_V3_5 = False
-HAS_TLE_V3_2 = False
-
-if _triton_version_at_least(3, 2, 0):  # ascend32
-    try:
-        import triton.experimental.tle.language as tle
-
-        HAS_TLE_V3_2 = True
-    except ImportError:
-        tle = None
-        HAS_TLE_V3_2 = False
-else:
-    tle = None
-    HAS_TLE_V3_5 = False
-    HAS_TLE_V3_2 = False
-
-
-SUPPORT_UINT64 = False if runtime_device.vendor_name == "ascend" else True
 logger = logging.getLogger(__name__)
 
 
@@ -316,14 +281,9 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     renormalize,
     routed_scaling_factor,
     scores_stride0,
-    g_score_sigmoid_ptr,
-    g_score_bias_ptr,
     #dump_ptr,
     #dump_ptr2,
     SCORING_FUNC: tl.constexpr,
-    HAS_TLE_V3_2: tl.constexpr,
-    HAS_TLE_V3_5: tl.constexpr,
-    SUPPORT_UINT64: tl.constexpr,
     FULL_SHAPE: tl.constexpr,
     NUM_GROUPS_PAD: tl.constexpr
 ):
@@ -608,20 +568,6 @@ def grouped_topk(
             device=scores.device,
             dtype=torch.int32,
         )
-        if not HAS_TLE_V3_5 and not HAS_TLE_V3_2:
-            g_scores_sigmoid = torch.empty(
-                (num_tokens, num_experts),
-                device=scores.device,
-                dtype=torch.float32,
-            )
-            g_scores_bias = torch.empty(
-                (num_tokens, num_experts),
-                device=scores.device,
-                dtype=torch.float32,
-            )
-        else:
-            g_scores_sigmoid = None
-            g_scores_bias = None
 
         n_group_pad = triton.next_power_of_2(n_group)
         #dump_buf = torch.empty((num_tokens, num_experts), device=scores.device, dtype=torch.float32)
@@ -641,14 +587,9 @@ def grouped_topk(
             renormalize,
             routed_scaling_factor,
             scores.stride(0),
-            g_scores_sigmoid,
-            g_scores_bias,
             #dump_buf,
             #dump_buf2,
             SCORING_FUNC=scoring_func,
-            HAS_TLE_V3_5=HAS_TLE_V3_5,
-            HAS_TLE_V3_2=HAS_TLE_V3_2,
-            SUPPORT_UINT64=SUPPORT_UINT64,
             FULL_SHAPE = (num_experts_per_group == 32) & (n_group_pad == n_group),
             NUM_GROUPS_PAD = n_group_pad,
             num_warps=1,
